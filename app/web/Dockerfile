@@ -10,6 +10,14 @@
     
     ARG VITE_API_URL
     ENV VITE_API_URL=${VITE_API_URL}
+
+    # CloudWatch RUM (src/rum.ts) — optional; RUM is skipped when unset
+    ARG VITE_RUM_APP_ID
+    ARG VITE_RUM_IDENTITY_POOL_ID
+    ARG VITE_AWS_REGION
+    ENV VITE_RUM_APP_ID=${VITE_RUM_APP_ID} \
+        VITE_RUM_IDENTITY_POOL_ID=${VITE_RUM_IDENTITY_POOL_ID} \
+        VITE_AWS_REGION=${VITE_AWS_REGION}
     
     RUN npm run build
     

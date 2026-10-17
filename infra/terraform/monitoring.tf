@@ -70,8 +70,11 @@ resource "aws_ssm_parameter" "cw_agent_config" {
     metrics = {
       append_dimensions = { InstanceId = "$${aws:InstanceId}" }
       metrics_collected = {
-        mem     = { measurement = ["mem_used_percent"] }
-        disk    = { measurement = ["disk_used_percent"], resources = ["/"] }
+        mem = { measurement = ["mem_used_percent"] }
+        # drop_device: the root device name differs by instance family
+        # (xvda1 on Xen, nvme0n1p1 on Nitro), so keep it out of the dimensions
+        # the disk alarm and dashboard must match.
+        disk    = { measurement = ["disk_used_percent"], resources = ["/"], drop_device = true }
         diskio  = { measurement = ["io_time", "write_bytes", "read_bytes"], resources = ["*"] }
         netstat = { measurement = ["tcp_established", "tcp_time_wait"] }
       }
@@ -230,7 +233,6 @@ resource "aws_cloudwatch_metric_alarm" "disk_high" {
   dimensions = {
     InstanceId = aws_instance.skybroe.id
     path       = "/"
-    device     = "xvda1"
     fstype     = "xfs"
   }
   tags = local.protect
@@ -328,7 +330,7 @@ resource "aws_cloudwatch_dashboard" "skybroe" {
           view    = "timeSeries"
           period  = 300
           stat    = "Maximum"
-          metrics = [["CWAgent", "disk_used_percent", "InstanceId", aws_instance.skybroe.id, "path", "/", "device", "xvda1", "fstype", "xfs"]]
+          metrics = [["CWAgent", "disk_used_percent", "InstanceId", aws_instance.skybroe.id, "path", "/", "fstype", "xfs"]]
           yAxis   = { left = { min = 0, max = 100 } }
         }
       },
@@ -340,7 +342,7 @@ resource "aws_cloudwatch_dashboard" "skybroe" {
           view   = "timeSeries"
           period = 60
           metrics = [
-            ["AWS/EC2", "NetworkIn",  "InstanceId", aws_instance.skybroe.id, { stat = "Sum", label = "In" }],
+            ["AWS/EC2", "NetworkIn", "InstanceId", aws_instance.skybroe.id, { stat = "Sum", label = "In" }],
             ["AWS/EC2", "NetworkOut", "InstanceId", aws_instance.skybroe.id, { stat = "Sum", label = "Out" }]
           ]
         }
@@ -394,7 +396,7 @@ resource "aws_cloudwatch_dashboard" "skybroe" {
           period = 60
           metrics = [
             ["AWS/ApplicationELB", "ActiveConnectionCount", "LoadBalancer", aws_lb.skybroe.arn_suffix, { stat = "Sum", label = "Active" }],
-            ["AWS/ApplicationELB", "NewConnectionCount",    "LoadBalancer", aws_lb.skybroe.arn_suffix, { stat = "Sum", label = "New" }]
+            ["AWS/ApplicationELB", "NewConnectionCount", "LoadBalancer", aws_lb.skybroe.arn_suffix, { stat = "Sum", label = "New" }]
           ]
         }
       },

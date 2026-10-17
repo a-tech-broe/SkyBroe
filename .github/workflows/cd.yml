@@ -92,10 +92,6 @@ jobs:
       matrix:
         service: [backend, web]
 
-    outputs:
-      backend-digest: ${{ steps.build.outputs.digest }}
-      web-digest: ${{ steps.build.outputs.digest }}
-
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
@@ -139,6 +135,12 @@ jobs:
           sbom: true
           cache-from: type=gha,scope=${{ matrix.service }}-prod
           cache-to: type=gha,scope=${{ matrix.service }}-prod,mode=max
+          # Web only (ignored by the backend Dockerfile). RUM stays disabled
+          # until the repo variables are set from `terraform output`.
+          build-args: |
+            VITE_RUM_APP_ID=${{ vars.VITE_RUM_APP_ID }}
+            VITE_RUM_IDENTITY_POOL_ID=${{ vars.VITE_RUM_IDENTITY_POOL_ID }}
+            VITE_AWS_REGION=${{ secrets.AWS_REGION || 'us-east-1' }}
 
       - name: Trivy image scan
         id: trivy-image
@@ -577,17 +579,21 @@ jobs:
           echo "::error::Web health check failed after 30 attempts (5 min)"
           exit 1
 
+      # Data routes require a JWT, so an unauthenticated request should get a
+      # 401 from the backend — proving ALB → backend routing and the auth gate.
       - name: Weather API smoke test
         run: |
-          curl -sf "https://${{ secrets.APP_DOMAIN }}/api/weather/metar?ids=KORD" \
-            && echo "Weather API OK" \
-            || echo "::warning::Weather API unavailable (external dependency)"
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' "https://${{ secrets.APP_DOMAIN }}/api/weather/metar/KORD")
+          [ "$CODE" = "401" ] \
+            && echo "Weather API routed and auth-protected (401)" \
+            || echo "::warning::Weather API returned HTTP $CODE (expected 401 without a token)"
 
       - name: Airport API smoke test
         run: |
-          curl -sf "https://${{ secrets.APP_DOMAIN }}/api/airports?ids=KORD" \
-            && echo "Airports API OK" \
-            || echo "::warning::Airports API unavailable (external dependency)"
+          CODE=$(curl -s -o /dev/null -w '%{http_code}' "https://${{ secrets.APP_DOMAIN }}/api/airports/KORD")
+          [ "$CODE" = "401" ] \
+            && echo "Airports API routed and auth-protected (401)" \
+            || echo "::warning::Airports API returned HTTP $CODE (expected 401 without a token)"
 
   # ── 8. Summary ────────────────────────────────────────────────────
   summary:

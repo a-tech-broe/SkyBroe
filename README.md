@@ -381,9 +381,8 @@ SkyBroe/
 ### Dev
 
 ```bash
-# Copy and fill in your env vars
-cp .env .env.local           # or create app/.env from scratch
-# Required: FAA_CLIENT_ID, FAA_CLIENT_SECRET, DB_USER, DB_PASSWORD, ANTHROPIC_API_KEY
+# Create app/.env with your API keys (dev uses built-in DB creds and a dev JWT fallback)
+# Needed for full functionality: FAA_CLIENT_ID, FAA_CLIENT_SECRET, ANTHROPIC_API_KEY
 
 docker compose -f app/docker-compose.dev.yml up --build
 ```
@@ -397,8 +396,9 @@ docker compose -f app/docker-compose.dev.yml up --build
 ### Production (build from source)
 
 ```bash
-# Required: DB_PASSWORD, FAA_CLIENT_ID, FAA_CLIENT_SECRET, ANTHROPIC_API_KEY
-docker compose -f app/docker-compose.yml up --build -d
+# Required: JWT_SECRET (backend refuses to boot without it), DB_PASSWORD,
+#           FAA_CLIENT_ID, FAA_CLIENT_SECRET, ANTHROPIC_API_KEY
+docker compose -f app/docker-compose.yml up --build -d   # web on http://localhost
 ```
 
 ---
@@ -475,6 +475,15 @@ Manually dispatched, with a typed `DESTROY` confirmation and **dry-run on by def
 | `EC2_HOST` | App server Elastic IP — allocate before first deploy, set as secret |
 | `EC2_SSH_KEY` | Private key content (PEM) for app EC2 |
 | `SEMGREP_APP_TOKEN` | Optional — enables Semgrep cloud dashboard |
+
+### GitHub Variables (optional)
+
+| Variable | Used by |
+|---|---|
+| `VITE_RUM_APP_ID` | CD web build — from `terraform output rum_app_monitor_id`; enables CloudWatch RUM |
+| `VITE_RUM_IDENTITY_POOL_ID` | CD web build — from `terraform output rum_identity_pool_id` |
+
+RUM stays disabled in the browser until both are set (the IDs only exist after the first `terraform apply`, so set them and re-run CD).
 
 ---
 
@@ -583,6 +592,9 @@ terraform apply  # provision
 | `GET` | `/api/airports/:icao/charts` | FAA d-TPP charts for AIRAC cycle |
 | `GET` | `/api/airports/:icao/alternates?radius=50` | Nearby airports within radius nm with METARs |
 | `GET` | `/api/winds/:icao` | Parsed FD winds aloft for station |
+| `GET` | `/api/map/metars` | METARs for the weather map |
+| `GET` | `/api/map/sigmets` | SIGMET GeoJSON for the weather map |
+| `GET` | `/api/map/tfrs` | TFR GeoJSON for the weather map |
 | `GET` | `/api/history?deviceId=&type=` | Recent ICAO searches for device |
 | `POST` | `/api/history` | Record a search event |
 | `POST` | `/api/voice/brief` | Generate AI plain-English briefing via Claude Haiku |

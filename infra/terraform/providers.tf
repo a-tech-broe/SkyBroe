@@ -1,5 +1,5 @@
 terraform {
-  required_version = ">= 1.6"
+  required_version = ">= 1.8"
   required_providers {
     aws = {
       source  = "hashicorp/aws"
@@ -8,7 +8,7 @@ terraform {
   }
 
   backend "s3" {
-    # Values injected via -backend-config in infra.yml (kept out of source)
+    # Values injected via -backend-config in ci.yml / cd.yml (kept out of source)
     # bucket         = var TF_BACKEND_BUCKET
     # key            = "ec2/terraform.tfstate"
     # region         = var TF_BACKEND_REGION
