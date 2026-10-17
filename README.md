@@ -502,7 +502,7 @@ Application Load Balancer  (HTTPS :443 — TLS terminated)
    ├── /health ──────► App EC2 :3001
    └── /*      ──────► App EC2 :80    (nginx → React SPA)
 
-App EC2  (m5.xlarge)
+App EC2  (t3.medium)
 ├── web      :80
 └── backend  :3001
 ```
@@ -511,8 +511,8 @@ App EC2  (m5.xlarge)
 
 | Resource | Detail |
 |---|---|
-| App EC2 | Amazon Linux 2023, `m5.xlarge`, 30 GB gp3 encrypted |
-| ALB | Application Load Balancer — HTTP→HTTPS redirect, path-based routing, access logs → S3 |
+| App EC2 | Amazon Linux 2023, `t3.medium`, 30 GB gp3 encrypted |
+| ALB | Application Load Balancer in 2 AZs (the instance's + one more) — HTTP→HTTPS redirect, path-based routing, access logs → S3 |
 | ACM | TLS certificate for `APP_DOMAIN` — DNS validated |
 | Internet gateway | The default VPC's existing IGW, referenced as a **data source** (not created — a default VPC already has one) |
 | Security groups | ALB SG (80+443 public); App SG |
