@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 import {
   View,
   Text,
@@ -12,7 +12,6 @@ import {
   NativeSyntheticEvent,
   NativeScrollEvent,
   useWindowDimensions,
-  ReactNode,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
