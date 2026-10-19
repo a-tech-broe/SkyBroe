@@ -67,34 +67,31 @@ resource "aws_ssm_parameter" "cw_agent_config" {
   tags = local.protect
 }
 
-# ── SSM Associations — install + configure CloudWatch Agent ───────
-# Requires the instance role's AmazonSSMManagedInstanceCore attachment.
-resource "aws_ssm_association" "cw_agent_install" {
-  name = "AWS-ConfigureAWSPackage"
+# ── SSM Association — install + configure CloudWatch Agent ────────
+# One script so install and configure run in order. (The previous pair of
+# associations raced — configure ran before install — and requested the
+# non-existent Distributor package "AmazonCloudWatch", so the agent never
+# installed.) The agent comes from the Amazon Linux repo. The config version
+# in the script makes SSM re-run it whenever the agent config changes.
+# Requires the instance role's AmazonSSMManagedInstanceCore attachment and
+# ssm:GetParameter on /skybroe/* (skybroe-ssm-read).
+resource "aws_ssm_association" "cw_agent" {
+  name             = "AWS-RunShellScript"
+  association_name = "skybroe-cloudwatch-agent"
   targets {
     key    = "InstanceIds"
     values = [aws_instance.skybroe.id]
   }
   parameters = {
-    action = "Install"
-    name   = "AmazonCloudWatch"
+    commands = <<-EOT
+      set -e
+      # agent config version ${aws_ssm_parameter.cw_agent_config.version}
+      rpm -q amazon-cloudwatch-agent >/dev/null || dnf install -y amazon-cloudwatch-agent
+      /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+        -a fetch-config -m ec2 -s -c ssm:${aws_ssm_parameter.cw_agent_config.name}
+      /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status
+    EOT
   }
-}
-
-resource "aws_ssm_association" "cw_agent_configure" {
-  name = "AmazonCloudWatch-ManageAgent"
-  targets {
-    key    = "InstanceIds"
-    values = [aws_instance.skybroe.id]
-  }
-  parameters = {
-    action                        = "configure"
-    mode                          = "ec2"
-    optionalConfigurationSource   = "ssm"
-    optionalConfigurationLocation = aws_ssm_parameter.cw_agent_config.name
-    optionalRestart               = "yes"
-  }
-  depends_on = [aws_ssm_association.cw_agent_install]
 }
 
 # ── CloudWatch RUM — Cognito Identity Pool ────────────────────────
