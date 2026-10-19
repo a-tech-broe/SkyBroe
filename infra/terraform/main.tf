@@ -29,14 +29,19 @@ resource "aws_route" "internet" {
   gateway_id             = data.aws_internet_gateway.default.id
 }
 
-# ── AMI — latest Amazon Linux 2023 x86_64 ────────────────────────
+# ── AMI — latest Amazon Linux 2023 for the instance's CPU arch ────
+# Graviton (t4g, …) types need the arm64 AMI; the app images are multi-arch.
+data "aws_ec2_instance_type" "app" {
+  instance_type = var.instance_type
+}
+
 data "aws_ami" "al2023" {
   most_recent = true
   owners      = ["amazon"]
 
   filter {
     name   = "name"
-    values = ["al2023-ami-*-x86_64"]
+    values = ["al2023-ami-2023.*-${local.arch}"]
   }
 
   filter {
@@ -87,6 +92,13 @@ resource "aws_iam_role_policy_attachment" "cw_agent" {
   policy_arn = "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
 }
 
+# Registers the instance with SSM so the CloudWatch-agent associations in
+# monitoring.tf can run (and enables keyless Session Manager shell access).
+resource "aws_iam_role_policy_attachment" "ssm_core" {
+  role       = aws_iam_role.skybroe_ec2.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
 resource "aws_iam_role_policy_attachment" "xray" {
   role       = aws_iam_role.skybroe_ec2.name
   policy_arn = "arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess"
@@ -123,20 +135,23 @@ resource "aws_security_group" "skybroe" {
   description = "Skybroe: HTTP + HTTPS inbound, SSH restricted"
   vpc_id      = data.aws_vpc.default.id
 
+  # Caddy on the instance terminates TLS (no ALB). Port 80 stays open for
+  # Let's Encrypt HTTP-01 challenges and the redirect to HTTPS. The backend
+  # (3001) is no longer exposed — Caddy reaches it on the Docker network.
   ingress {
-    description     = "HTTP from ALB"
-    from_port       = 80
-    to_port         = 80
-    protocol        = "tcp"
-    security_groups = [aws_security_group.alb.id]
+    description = "HTTP (ACME challenge + redirect to HTTPS)"
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
   ingress {
-    description     = "Backend API from ALB"
-    from_port       = 3001
-    to_port         = 3001
-    protocol        = "tcp"
-    security_groups = [aws_security_group.alb.id]
+    description = "HTTPS"
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
   ingress {
@@ -194,7 +209,7 @@ resource "aws_instance" "skybroe" {
 
   root_block_device {
     volume_type = "gp3"
-    volume_size = 30
+    volume_size = var.root_volume_gb
     encrypted   = true
   }
 
@@ -206,14 +221,9 @@ resource "aws_instance" "skybroe" {
     http_put_response_hop_limit = 2
   }
 
-  user_data = templatefile("${path.module}/user_data.sh.tpl", {
-    aws_region         = var.aws_region
-    ssm_prefix         = var.ssm_prefix
-    dockerhub_username = var.dockerhub_username
-    image_tag          = var.app_image_tag
-    domain_name        = var.domain_name
-    ses_from_email     = local.ses_from_email
-  })
+  # Bootstrap only (Docker, swap, systemd unit). The deploy job ships the
+  # compose file + Caddyfile from infra/ and writes .env.
+  user_data = file("${path.module}/user_data.sh")
 
   tags = { Name = "skybroe-app" }
 

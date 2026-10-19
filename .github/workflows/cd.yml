@@ -207,7 +207,6 @@ jobs:
       AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION:    ${{ secrets.AWS_REGION || 'us-east-1' }}
-      TF_VAR_dockerhub_username: ${{ secrets.DOCKERHUB_USERNAME }}
       TF_VAR_key_name: keyit
       TF_VAR_domain_name: ${{ secrets.APP_DOMAIN }}
       TF_VAR_hosted_zone_id: ${{ secrets.HOSTED_ZONE_ID }}
@@ -243,13 +242,13 @@ jobs:
             && echo "Stale route removed" || echo "No conflicting route"
 
       - name: Import existing AWS resources into state
-        # The cleanup workflow destroys only the cost-incurring EC2 instance
-        # and ALB; everything tagged do_not_delete=true (networking, IAM, and
-        # the whole observability stack) survives. If the Terraform state was
-        # also wiped, those survivors must be re-imported here before apply,
+        # The cleanup workflow destroys only the cost-incurring EC2 instance;
+        # everything tagged do_not_delete=true (networking, IAM, and the whole
+        # observability stack) survives. If the Terraform state was also
+        # wiped, those survivors must be re-imported here before apply,
         # otherwise apply tries to *create* resources that already exist and
         # fails with AlreadyExists. Keep this list in sync with the protected
-        # resources in main.tf / alb.tf / monitoring.tf.
+        # resources in main.tf / monitoring.tf.
         run: |
           REGION="${{ secrets.AWS_REGION || 'us-east-1' }}"
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
@@ -273,34 +272,20 @@ jobs:
             "skybroe-ec2-role/arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
           tf_import_if_missing aws_iam_role_policy_attachment.xray \
             "skybroe-ec2-role/arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess"
+          tf_import_if_missing aws_iam_role_policy_attachment.ssm_core \
+            "skybroe-ec2-role/arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
 
           # ── IAM — RUM unauthenticated guest role ────────────────────
           tf_import_if_missing aws_iam_role.rum_unauth skybroe-rum-unauth
           tf_import_if_missing aws_iam_role_policy.rum_unauth \
             skybroe-rum-unauth:skybroe-rum-unauth-policy
 
-          # ── Security groups (app + ALB; both protected, survive) ────
+          # ── Security group (protected, survives) ────────────────────
           SG_ID=$(aws ec2 describe-security-groups \
             --filters "Name=group-name,Values=skybroe-sg" \
             --query "SecurityGroups[0].GroupId" --output text --region "$REGION" 2>/dev/null || true)
           [ -n "$SG_ID" ] && [ "$SG_ID" != "None" ] && \
             tf_import_if_missing aws_security_group.skybroe "$SG_ID"
-
-          ALB_SG_ID=$(aws ec2 describe-security-groups \
-            --filters "Name=group-name,Values=skybroe-alb-sg" \
-            --query "SecurityGroups[0].GroupId" --output text --region "$REGION" 2>/dev/null || true)
-          [ -n "$ALB_SG_ID" ] && [ "$ALB_SG_ID" != "None" ] && \
-            tf_import_if_missing aws_security_group.alb "$ALB_SG_ID"
-
-          # ── Target groups (protected, survive; ALB itself is recreated)
-          for pair in "web:skybroe-web-tg" "backend:skybroe-api-tg"; do
-            ADDR="aws_lb_target_group.${pair%%:*}"
-            TG_NAME="${pair##*:}"
-            TG_ARN=$(aws elbv2 describe-target-groups --names "$TG_NAME" \
-              --query "TargetGroups[0].TargetGroupArn" --output text --region "$REGION" 2>/dev/null || true)
-            [ -n "$TG_ARN" ] && [ "$TG_ARN" != "None" ] && \
-              tf_import_if_missing "$ADDR" "$TG_ARN"
-          done
 
           # ── EC2 instance (skybroe-app) ───────────────────────────────
           APP_INSTANCE_ID=$(aws ec2 describe-instances \
@@ -335,18 +320,11 @@ jobs:
             echo "Removed legacy aws_internet_gateway.skyops from state (now a data source)"
           fi
 
-          # ── Observability — SNS / logs / S3 / SSM ───────────────────
+          # ── Observability — SNS / logs / SSM ────────────────────────
           tf_import_if_missing aws_sns_topic.alerts "arn:aws:sns:${REGION}:${ACCOUNT_ID}:skybroe-alerts"
           tf_import_if_missing aws_cloudwatch_log_group.app /skybroe/app
           tf_import_if_missing aws_cloudwatch_log_group.system /skybroe/system
           tf_import_if_missing aws_ssm_parameter.cw_agent_config /skybroe/cloudwatch-agent-config
-
-          BUCKET="skybroe-alb-logs-${ACCOUNT_ID}"
-          if aws s3api head-bucket --bucket "$BUCKET" --region "$REGION" 2>/dev/null; then
-            tf_import_if_missing aws_s3_bucket.alb_logs "$BUCKET"
-            tf_import_if_missing aws_s3_bucket_lifecycle_configuration.alb_logs "$BUCKET"
-            tf_import_if_missing aws_s3_bucket_policy.alb_logs "$BUCKET"
-          fi
 
           # ── Observability — RUM + Cognito guest access ──────────────
           tf_import_if_missing aws_rum_app_monitor.skybroe skybroe-web
@@ -363,9 +341,7 @@ jobs:
           tf_import_if_missing aws_cloudwatch_metric_alarm.cpu_high      skybroe-cpu-high
           tf_import_if_missing aws_cloudwatch_metric_alarm.memory_high   skybroe-memory-high
           tf_import_if_missing aws_cloudwatch_metric_alarm.disk_high     skybroe-disk-high
-          tf_import_if_missing aws_cloudwatch_metric_alarm.alb_5xx       skybroe-alb-5xx
-          tf_import_if_missing aws_cloudwatch_metric_alarm.alb_latency   skybroe-alb-latency
-          tf_import_if_missing aws_cloudwatch_metric_alarm.alb_unhealthy skybroe-alb-unhealthy-hosts
+          tf_import_if_missing aws_cloudwatch_metric_alarm.status_check  skybroe-status-check-failed
           tf_import_if_missing aws_cloudwatch_dashboard.skybroe SkyBroe-Overview
 
           # ── SES — domain identity for transactional email ──────────
@@ -411,9 +387,10 @@ jobs:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           EC2_HOST:           ${{ secrets.EC2_HOST }}
           EC2_SSH_KEY:        ${{ secrets.EC2_SSH_KEY }}
+          APP_DOMAIN:         ${{ secrets.APP_DOMAIN }}
         run: |
           missing=0
-          for name in JWT_SECRET DB_USER DB_PASSWORD DOCKERHUB_USERNAME EC2_HOST EC2_SSH_KEY; do
+          for name in JWT_SECRET DB_USER DB_PASSWORD DOCKERHUB_USERNAME EC2_HOST EC2_SSH_KEY APP_DOMAIN; do
             if [ -z "${!name}" ]; then
               echo "::error::Required secret '${name}' is not set — configure it in repo Settings → Secrets and variables → Actions"
               missing=1
@@ -432,27 +409,46 @@ jobs:
           echo "::error::EC2 SSH port 22 never became reachable after 4 minutes"
           exit 1
 
+      # Ship the stack definition straight from the repo — the compose file
+      # and Caddyfile in infra/ are the single source of truth for EC2.
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: infra
+
+      - name: Copy compose file + Caddyfile to EC2
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ec2-user
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: infra/docker-compose.prod.yml,infra/Caddyfile
+          target: /tmp/skybroe-deploy
+          strip_components: 1
+
       - name: Write .env and restart containers
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ec2-user
           key: ${{ secrets.EC2_SSH_KEY }}
-          envs: DOCKERHUB_USERNAME,DB_USER,DB_PASSWORD,JWT_SECRET,FAA_CLIENT_ID,FAA_CLIENT_SECRET,ANTHROPIC_API_KEY,VITE_API_URL,AWS_REGION,APP_URL,SES_FROM_EMAIL
+          envs: DOCKERHUB_USERNAME,DB_USER,DB_PASSWORD,JWT_SECRET,FAA_CLIENT_ID,FAA_CLIENT_SECRET,ANTHROPIC_API_KEY,AWS_REGION,APP_DOMAIN,APP_URL,SES_FROM_EMAIL
           script: |
             set -e
             # Install Docker + Compose plugin if not already present
+            # (normally done by user_data; this covers an older instance).
             if ! command -v docker &>/dev/null; then
               sudo dnf install -y docker
               sudo systemctl enable --now docker
             fi
             if ! sudo docker compose version &>/dev/null 2>&1; then
               curl -fsSL -o /tmp/docker-compose \
-                "https://github.com/docker/compose/releases/download/v2.27.0/docker-compose-linux-x86_64"
+                "https://github.com/docker/compose/releases/download/v2.27.1/docker-compose-linux-$(uname -m)"
               sudo mkdir -p /usr/local/lib/docker/cli-plugins
               sudo install -m 0755 /tmp/docker-compose /usr/local/lib/docker/cli-plugins/docker-compose
             fi
             sudo mkdir -p /opt/skybroe
+            sudo install -m 0644 /tmp/skybroe-deploy/docker-compose.prod.yml /tmp/skybroe-deploy/Caddyfile /opt/skybroe/
+            rm -rf /tmp/skybroe-deploy
             sudo tee /opt/skybroe/.env > /dev/null <<EOF
             DB_USER=${DB_USER}
             DB_PASSWORD=${DB_PASSWORD}
@@ -460,73 +456,14 @@ jobs:
             FAA_CLIENT_ID=${FAA_CLIENT_ID}
             FAA_CLIENT_SECRET=${FAA_CLIENT_SECRET}
             ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-            VITE_API_URL=${VITE_API_URL}
             DOCKERHUB_USERNAME=${DOCKERHUB_USERNAME}
             AWS_REGION=${AWS_REGION}
+            APP_DOMAIN=${APP_DOMAIN}
             APP_URL=${APP_URL}
             SES_FROM_EMAIL=${SES_FROM_EMAIL}
             IMAGE_TAG=latest
             EOF
             sudo chmod 600 /opt/skybroe/.env
-            sudo tee /opt/skybroe/docker-compose.prod.yml > /dev/null <<'COMPOSE'
-            services:
-              db:
-                image: postgres:16-alpine
-                restart: unless-stopped
-                environment:
-                  POSTGRES_DB: skybroe
-                  POSTGRES_USER: ${DB_USER}
-                  POSTGRES_PASSWORD: ${DB_PASSWORD}
-                volumes:
-                  - pgdata:/var/lib/postgresql/data
-                healthcheck:
-                  test: ["CMD-SHELL", "pg_isready -U ${DB_USER}"]
-                  interval: 10s
-                  timeout: 5s
-                  retries: 5
-              backend:
-                image: ${DOCKERHUB_USERNAME}/skybroe-backend:${IMAGE_TAG:-latest}
-                restart: unless-stopped
-                depends_on:
-                  db:
-                    condition: service_healthy
-                environment:
-                  NODE_ENV: production
-                  PORT: 3001
-                  DB_URL: postgresql://${DB_USER}:${DB_PASSWORD}@db:5432/skybroe
-                  FAA_CLIENT_ID: ${FAA_CLIENT_ID}
-                  FAA_CLIENT_SECRET: ${FAA_CLIENT_SECRET}
-                  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
-                  JWT_SECRET: ${JWT_SECRET}
-                  AWS_REGION: ${AWS_REGION}
-                  APP_URL: ${APP_URL}
-                  SES_FROM_EMAIL: ${SES_FROM_EMAIL}
-                logging:
-                  driver: awslogs
-                  options:
-                    awslogs-region: ${AWS_REGION}
-                    awslogs-group: /skybroe/app
-                    awslogs-stream: backend
-                    awslogs-create-group: "true"
-                ports:
-                  - "3001:3001"
-              web:
-                image: ${DOCKERHUB_USERNAME}/skybroe-web:${IMAGE_TAG:-latest}
-                restart: unless-stopped
-                depends_on:
-                  - backend
-                logging:
-                  driver: awslogs
-                  options:
-                    awslogs-region: ${AWS_REGION}
-                    awslogs-group: /skybroe/app
-                    awslogs-stream: web
-                    awslogs-create-group: "true"
-                ports:
-                  - "80:8080"
-            volumes:
-              pgdata:
-            COMPOSE
             cd /opt/skybroe
             sudo docker compose -f docker-compose.prod.yml pull
             sudo docker compose -f docker-compose.prod.yml up -d --remove-orphans
@@ -539,7 +476,7 @@ jobs:
           FAA_CLIENT_ID:      ${{ secrets.FAA_CLIENT_ID }}
           FAA_CLIENT_SECRET:  ${{ secrets.FAA_CLIENT_SECRET }}
           ANTHROPIC_API_KEY:  ${{ secrets.ANTHROPIC_API_KEY }}
-          VITE_API_URL:       https://${{ secrets.APP_DOMAIN }}
+          APP_DOMAIN:         ${{ secrets.APP_DOMAIN }}
           AWS_REGION:         ${{ secrets.AWS_REGION || 'us-east-1' }}
           APP_URL:            https://${{ secrets.APP_DOMAIN }}
           SES_FROM_EMAIL:     ${{ secrets.SES_FROM_EMAIL || format('noreply@{0}', secrets.APP_DOMAIN) }}

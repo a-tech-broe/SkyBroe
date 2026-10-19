@@ -122,11 +122,30 @@ jobs:
           delete_r53_record "$DOMAIN"
           delete_r53_record "www.$DOMAIN"
 
-          # ACM DNS-validation CNAMEs
-          CERT_ARN=$(aws acm list-certificates \
+          # ACM DNS-validation CNAMEs — only for SkyBroe's own certificate
+          # (tagged Name=skybroe-cert). Other projects can hold certificates
+          # for the same domain, and ACM reuses one validation CNAME per
+          # domain name across an account's certificates, so any CNAME that a
+          # foreign certificate also uses must survive or it stops renewing.
+          CERT_ARNS=$(aws acm list-certificates \
             --query "CertificateSummaryList[?DomainName=='$DOMAIN'].CertificateArn" \
             --output text 2>/dev/null || true)
-          if [ -n "$CERT_ARN" ] && [ "$CERT_ARN" != "None" ]; then
+          FOREIGN_CNAMES=""
+          for CERT_ARN in $CERT_ARNS; do
+            CERT_NAME=$(aws acm list-tags-for-certificate --certificate-arn "$CERT_ARN" \
+              --query "Tags[?Key=='Name'].Value | [0]" --output text 2>/dev/null || true)
+            [ "$CERT_NAME" = "skybroe-cert" ] && continue
+            FOREIGN_CNAMES="$FOREIGN_CNAMES $(aws acm describe-certificate --certificate-arn "$CERT_ARN" \
+              --query "Certificate.DomainValidationOptions[].ResourceRecord.Name" --output text 2>/dev/null || true)"
+          done
+
+          for CERT_ARN in $CERT_ARNS; do
+            CERT_NAME=$(aws acm list-tags-for-certificate --certificate-arn "$CERT_ARN" \
+              --query "Tags[?Key=='Name'].Value | [0]" --output text 2>/dev/null || true)
+            if [ "$CERT_NAME" != "skybroe-cert" ]; then
+              echo "SKIP — certificate $CERT_ARN is not SkyBroe's (Name=$CERT_NAME); keeping its validation CNAMEs"
+              continue
+            fi
             aws acm describe-certificate --certificate-arn "$CERT_ARN" \
               --query "Certificate.DomainValidationOptions[].ResourceRecord" \
               --output json 2>/dev/null \
@@ -136,7 +155,9 @@ jobs:
               TYPE=$(echo "$rec" | jq -r '.Type')
               BATCH=$(jq -n --arg n "$NAME" --arg v "$VALUE" --arg t "$TYPE" \
                 '{Changes:[{Action:"DELETE",ResourceRecordSet:{Name:$n,Type:$t,TTL:60,ResourceRecords:[{Value:$v}]}}]}')
-              if [ "$DRY_RUN" = "true" ]; then
+              if printf '%s\n' $FOREIGN_CNAMES | grep -qxF "$NAME"; then
+                echo "SKIP — validation CNAME $NAME is shared with another project's certificate"
+              elif [ "$DRY_RUN" = "true" ]; then
                 echo "[DRY RUN] Would delete ACM validation CNAME: $NAME"
               else
                 aws route53 change-resource-record-sets \
@@ -145,7 +166,7 @@ jobs:
                   || echo "CNAME $NAME not found or already gone"
               fi
             done
-          fi
+          done
 
       # ── Phase 2: ALB (rules → listeners → ALB → target groups) ─────
       - name: "Phase 2 — ALB (rules → listeners → ALB → target groups)"
@@ -359,24 +380,29 @@ jobs:
           DOMAIN="${{ secrets.APP_DOMAIN }}"
           [ -z "$DOMAIN" ] && echo "APP_DOMAIN not set — skipping." && exit 0
 
-          CERT_ARN=$(aws acm list-certificates \
+          # Several certificates can share a domain (e.g. another project's
+          # wildcard), so evaluate each one, and only ever touch SkyBroe's own
+          # (Name=skybroe-cert) — never just "every cert for this domain".
+          FOUND=0
+          for CERT_ARN in $(aws acm list-certificates \
             --query "CertificateSummaryList[?DomainName=='$DOMAIN'].CertificateArn" \
-            --output text 2>/dev/null || true)
-          [ -z "$CERT_ARN" ] || [ "$CERT_ARN" = "None" ] && \
-            echo "No certificate found for $DOMAIN." && exit 0
-
-          if grep -qF "$CERT_ARN" /tmp/protected_arns.txt 2>/dev/null; then
-            echo "SKIP — certificate $CERT_ARN tagged do_not_delete=true"
-            exit 0
-          fi
-
-          if [ "$DRY_RUN" = "true" ]; then
-            echo "[DRY RUN] Would delete ACM certificate: $CERT_ARN ($DOMAIN)"
-          else
-            aws acm delete-certificate --certificate-arn "$CERT_ARN" \
-              && echo "Deleted ACM certificate for $DOMAIN" \
-              || echo "WARNING: certificate deletion failed (may still be in use by ALB)"
-          fi
+            --output text 2>/dev/null || true); do
+            FOUND=1
+            CERT_NAME=$(aws acm list-tags-for-certificate --certificate-arn "$CERT_ARN" \
+              --query "Tags[?Key=='Name'].Value | [0]" --output text 2>/dev/null || true)
+            if [ "$CERT_NAME" != "skybroe-cert" ]; then
+              echo "SKIP — certificate $CERT_ARN is not SkyBroe's (Name=$CERT_NAME)"
+            elif grep -qF "$CERT_ARN" /tmp/protected_arns.txt 2>/dev/null; then
+              echo "SKIP — certificate $CERT_ARN tagged do_not_delete=true"
+            elif [ "$DRY_RUN" = "true" ]; then
+              echo "[DRY RUN] Would delete ACM certificate: $CERT_ARN ($DOMAIN)"
+            else
+              aws acm delete-certificate --certificate-arn "$CERT_ARN" \
+                && echo "Deleted ACM certificate $CERT_ARN" \
+                || echo "WARNING: certificate deletion failed (may still be in use by ALB)"
+            fi
+          done
+          [ "$FOUND" -eq 1 ] || echo "No certificate found for $DOMAIN."
 
       # ── Phase 7: Observability (CloudWatch / RUM / SNS / logs / S3) ─
       # All of these resources are tagged do_not_delete=true in Terraform
@@ -391,6 +417,7 @@ jobs:
 
           # CloudWatch metric alarms
           for A in skybroe-cpu-high skybroe-memory-high skybroe-disk-high \
+                   skybroe-status-check-failed \
                    skybroe-alb-5xx skybroe-alb-latency skybroe-alb-unhealthy-hosts; do
             EXISTS=$(aws cloudwatch describe-alarms --alarm-names "$A" \
               --query "MetricAlarms[0].AlarmName" --output text 2>/dev/null || true)
@@ -454,9 +481,13 @@ jobs:
           RUM_ROLE="skybroe-rum-unauth"
           RUM_ROLE_ARN=$(aws iam get-role --role-name "$RUM_ROLE" \
             --query "Role.Arn" --output text 2>/dev/null || true)
+          # IAM isn't covered by the Resource Groups Tagging API, so read the
+          # role's own tags rather than relying on /tmp/protected_arns.txt.
+          RUM_ROLE_TAG=$(aws iam list-role-tags --role-name "$RUM_ROLE" \
+            --query "Tags[?Key=='do_not_delete'].Value | [0]" --output text 2>/dev/null || true)
           if [ -z "$RUM_ROLE_ARN" ] || [ "$RUM_ROLE_ARN" = "None" ]; then
             echo "IAM role $RUM_ROLE not found."
-          elif protected "$RUM_ROLE_ARN"; then
+          elif [ "$RUM_ROLE_TAG" = "true" ] || protected "$RUM_ROLE_ARN"; then
             echo "SKIP — IAM role $RUM_ROLE tagged do_not_delete=true"
           elif [ "$DRY_RUN" = "true" ]; then
             echo "[DRY RUN] Would delete inline policies + IAM role $RUM_ROLE"
@@ -545,7 +576,11 @@ jobs:
           [ -z "$ROLE_ARN" ] || [ "$ROLE_ARN" = "None" ] && \
             echo "IAM role $ROLE_NAME not found." && exit 0
 
-          if grep -qF "$ROLE_ARN" /tmp/protected_arns.txt 2>/dev/null; then
+          # IAM isn't covered by the Resource Groups Tagging API, so check the
+          # role's and instance profile's own tags as well.
+          ROLE_TAG=$(aws iam list-role-tags --role-name "$ROLE_NAME" \
+            --query "Tags[?Key=='do_not_delete'].Value | [0]" --output text 2>/dev/null || true)
+          if [ "$ROLE_TAG" = "true" ] || grep -qF "$ROLE_ARN" /tmp/protected_arns.txt 2>/dev/null; then
             echo "SKIP — IAM role $ROLE_ARN tagged do_not_delete=true"
             exit 0
           fi
@@ -553,9 +588,11 @@ jobs:
           PROFILE_ARN=$(aws iam get-instance-profile \
             --instance-profile-name "skybroe-ec2-profile" \
             --query "InstanceProfile.Arn" --output text 2>/dev/null || true)
+          PROFILE_TAG=$(aws iam list-instance-profile-tags --instance-profile-name "skybroe-ec2-profile" \
+            --query "Tags[?Key=='do_not_delete'].Value | [0]" --output text 2>/dev/null || true)
           PROFILE_PROTECTED=false
           if [ -n "$PROFILE_ARN" ] && [ "$PROFILE_ARN" != "None" ] && \
-             grep -qF "$PROFILE_ARN" /tmp/protected_arns.txt 2>/dev/null; then
+             { [ "$PROFILE_TAG" = "true" ] || grep -qF "$PROFILE_ARN" /tmp/protected_arns.txt 2>/dev/null; }; then
             PROFILE_PROTECTED=true
           fi
 
@@ -656,9 +693,9 @@ jobs:
 
           **Resources always skipped:** Elastic IPs (pre-allocated, managed outside Terraform).
           **Other skips:** any resource tagged \`do_not_delete=true\` — this covers all networking, IAM,
-          and observability scaffolding (IGW, security groups, ACM cert, log groups, SNS, RUM, Cognito,
-          S3 logs bucket, alarms). A normal teardown therefore destroys only the cost-incurring EC2
-          instance and ALB, leaving the free scaffolding intact.
+          and observability scaffolding (security groups, log groups, SNS, RUM, Cognito, alarms).
+          A normal teardown therefore destroys only the cost-incurring EC2 instance, leaving the free
+          scaffolding intact. (The ALB / ACM phases only clean up leftovers from the pre-MVP design.)
 
           To re-provision, run the CD workflow from \`main\`.
           EOF

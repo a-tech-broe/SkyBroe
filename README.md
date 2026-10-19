@@ -351,12 +351,13 @@ SkyBroe/
 │   ├── docker-compose.yml          # Build from source (local prod simulation)
 │   └── docker-compose.dev.yml      # Dev with hot reload
 ├── infra/
-│   ├── terraform/                  # AWS — EC2, ALB, ACM, IAM, SGs, CloudWatch/RUM (Terraform ≥ 1.8)
-│   └── docker-compose.prod.yml     # App EC2 runtime (web + backend + db)
+│   ├── terraform/                  # AWS — EC2, DNS, IAM, SG, CloudWatch/RUM (Terraform ≥ 1.8)
+│   ├── docker-compose.prod.yml     # App EC2 runtime (caddy + web + backend + db)
+│   └── Caddyfile                   # TLS (Let's Encrypt) + routing on the instance
 └── .github/workflows/
     ├── ci.yml       # PR / dev — lint · scan · build · infra plan
     ├── cd.yml       # main    — build · push · infra apply · deploy · smoke test
-    └── cleanup.yml  # manual  — tear down cost-incurring resources (EC2 + ALB)
+    └── cleanup.yml  # manual  — tear down cost-incurring resources (EC2)
 ```
 
 ---
@@ -372,7 +373,7 @@ SkyBroe/
 | Voice | Web Speech API — browser-native TTS with smart voice picker (Google neural → Apple Samantha → Enhanced) |
 | Database | PostgreSQL 16 |
 | Containers | Docker + Docker Compose |
-| Infra | Terraform → AWS (EC2, ALB, ACM, IAM) |
+| Infra | Terraform → AWS (EC2 Graviton, Route53, IAM) · Caddy for TLS |
 
 ---
 
@@ -442,8 +443,8 @@ Runs all security gates (the dependency audit here blocks on **high**, scoped to
 | Job | What happens |
 |---|---|
 | Build & push | Multi-arch (`amd64` + `arm64`) → DockerHub + Trivy scan + Cosign sign + SBOM |
-| Infra apply | `terraform apply` — re-imports survivors, then provisions EC2, ALB, ACM, SGs, CloudWatch/RUM |
-| Deploy | SSH → app EC2 — writes `.env` + `docker-compose.prod.yml` → `docker compose up` |
+| Infra apply | `terraform apply` — re-imports survivors, then provisions EC2, DNS records, SG, IAM, CloudWatch/RUM |
+| Deploy | SCP `infra/docker-compose.prod.yml` + `infra/Caddyfile` → app EC2, write `.env` → `docker compose up` |
 | Production smoke test | HTTPS `curl` against `APP_DOMAIN`: `/health`, web HTML, weather and airport endpoints |
 | Summary | Release digest table + `cosign verify` instructions |
 
@@ -451,7 +452,7 @@ On a state-loss recovery (e.g. after a teardown that wiped Terraform state), `in
 
 ### `cleanup.yml` — manual teardown
 
-Manually dispatched, with a typed `DESTROY` confirmation and **dry-run on by default**. Walks resources in dependency order (Route53 → ALB → EC2 → security groups → ACM → observability → IAM → optional TF state) and **skips anything tagged `do_not_delete = true`**, so a normal run destroys only the EC2 instance and ALB. Set `dry_run=false` to actually delete; `clean_tf_state=true` additionally wipes the remote state file.
+Manually dispatched, with a typed `DESTROY` confirmation and **dry-run on by default**. Walks resources in dependency order (Route53 → EC2 → security groups → observability → IAM → optional TF state; ALB/ACM phases remain only to clear leftovers from the pre-MVP design) and **skips anything tagged `do_not_delete = true`**, so a normal run destroys only the EC2 instance. Set `dry_run=false` to actually delete; `clean_tf_state=true` additionally wipes the remote state file.
 
 ### GitHub Secrets
 
@@ -465,7 +466,7 @@ Manually dispatched, with a typed `DESTROY` confirmation and **dry-run on by def
 | `FAA_CLIENT_SECRET` | CD — written to app EC2 `.env` |
 | `JWT_SECRET` | CD — written to app EC2 `.env`; signs auth tokens |
 | `ANTHROPIC_API_KEY` | CD — written to app EC2 `.env`; required for AI voice brief |
-| `APP_DOMAIN` | CD — ACM cert domain + smoke tests (e.g. `skybroe.example.com`) |
+| `APP_DOMAIN` | CD — Caddy TLS certificate domain, DNS records + smoke tests (e.g. `skybroe.example.com`) |
 | `HOSTED_ZONE_ID` | CI/CD — Route53 hosted zone ID for auto DNS validation + A records (optional) |
 | `AWS_ACCESS_KEY_ID` | CI infra plan + CD infra apply |
 | `AWS_SECRET_ACCESS_KEY` | CI infra plan + CD infra apply |
@@ -491,48 +492,60 @@ RUM stays disabled in the browser until both are set (the IDs only exist after t
 
 ### Architecture
 
-```
-Internet
-   │
-   ▼
-Application Load Balancer  (HTTPS :443 — TLS terminated)
-   │  HTTP :80 → 301 redirect to HTTPS
-   │
-   ├── /api/*  ──────► App EC2 :3001  (Node.js API)
-   ├── /health ──────► App EC2 :3001
-   └── /*      ──────► App EC2 :80    (nginx → React SPA)
+Sized for an MVP with test users: a single small Graviton instance, no load balancer. Caddy on the instance terminates TLS with free, auto-renewing Let's Encrypt certificates and routes requests.
 
-App EC2  (t3.medium)
-├── web      :80
-└── backend  :3001
 ```
+Internet ── DNS A record (apex + www) ──► Elastic IP
+                                             │
+App EC2  (t4g.micro · arm64 · 1 GB + 2 GB swap)
+└── Caddy  :80 → 301 HTTPS · :443 TLS (Let's Encrypt)
+     ├── /api/*  ──► backend :3001  (Node.js API)
+     ├── /health ──► backend :3001
+     └── /*      ──► web     :8080  (nginx → React SPA)
+    backend ──► db (Postgres 16, local volume)
+```
+
+Only Caddy publishes host ports; backend, web and Postgres are reachable solely on the Docker network. The stack definition is `infra/docker-compose.prod.yml` + `infra/Caddyfile` — the deploy job copies both to the instance, so the repo is the single source of truth.
 
 ### What gets provisioned
 
 | Resource | Detail |
 |---|---|
-| App EC2 | Amazon Linux 2023, `t3.medium`, 30 GB gp3 encrypted |
-| ALB | Application Load Balancer in 2 AZs (the instance's + one more) — HTTP→HTTPS redirect, path-based routing, access logs → S3 |
-| ACM | TLS certificate for `APP_DOMAIN` — DNS validated |
+| App EC2 | Amazon Linux 2023 (arm64), `t4g.micro`, 16 GB gp3 encrypted, 2 GB swap — AMI architecture follows `instance_type`, and the subnet is pinned to an AZ that offers it |
+| TLS | Caddy + Let's Encrypt on the instance (certificates persist in the `caddy_data` volume) |
+| DNS | Route53 A records for `APP_DOMAIN` and `www.` → Elastic IP (when `HOSTED_ZONE_ID` is set) |
 | Internet gateway | The default VPC's existing IGW, referenced as a **data source** (not created — a default VPC already has one) |
-| Security groups | ALB SG (80+443 public); App SG |
-| IAM role | Least-privilege — SSM read scoped to `/skybroe/*`, SES send, CloudWatch agent, X-Ray |
+| Security group | 80 + 443 public (Caddy), 22 from `allowed_ssh_cidr` |
+| IAM role | Least-privilege — SSM read scoped to `/skybroe/*`, SES send, CloudWatch agent, SSM managed-instance core (also enables Session Manager), X-Ray |
 | Elastic IP | Pre-allocated — referenced as a data source, never recreated by Terraform |
-| Observability | CloudWatch dashboard, metric alarms, log groups, RUM, SNS alerts, S3 ALB-log bucket (see below) |
+| Observability | CloudWatch dashboard, metric alarms, log groups, RUM, SNS alerts (see below) — all within the free tier |
+
+### Estimated monthly cost (us-east-1, on-demand, light test traffic)
+
+| Item | $/month |
+|---|---|
+| EC2 `t4g.micro` | 6.13 |
+| EBS gp3 16 GB | 1.28 |
+| Public IPv4 (Elastic IP) | 3.65 |
+| Route53 hosted zone | 0.50 |
+| CloudWatch (2 custom metrics, 4 alarms, 1 dashboard, logs), RUM, SNS, SSM, Cognito | ~0.50 |
+| S3 + DynamoDB (Terraform state) | ~0.05 |
+| **Total** | **≈ $12** |
+
+The earlier ALB-based design cost ≈ $67/month — the ALB alone (hourly + LCUs + per-AZ public IPv4) was ≈ $27. Before adding a load balancer back, scale up first: `instance_type = "t4g.small"` (2 GB) is +$6/month. Container images are built for both `amd64` and `arm64`, so any instance family works. Anthropic API and SES usage are billed separately per use.
 
 ### Protected vs. disposable resources
 
-Every free / near-zero-cost resource (networking, IAM, ACM, target groups, listeners, and the entire observability stack) is tagged `do_not_delete = true`, and most also carry `lifecycle { prevent_destroy = true }`. Only the two cost-incurring resources — the **EC2 instance** and the **ALB** — are left disposable. This lets the `cleanup` workflow tear down the expensive pieces while preserving the scaffolding for cheap re-provisioning.
+Every free / near-zero-cost resource (networking, IAM and the entire observability stack) is tagged `do_not_delete = true`, and most also carry `lifecycle { prevent_destroy = true }`. Only the cost-incurring **EC2 instance** is left disposable. This lets the `cleanup` workflow tear down the expensive piece while preserving the scaffolding for cheap re-provisioning. Postgres data lives on the instance volume, so a teardown also discards the database.
 
 ### Observability
 
 | Component | Detail |
 |---|---|
-| Dashboard | `SkyBroe-Overview` — EC2 CPU/mem/disk/network, ALB request count / latency / status codes, and live app-log query widgets |
-| Alarms | CPU, memory, disk, ALB 5xx, ALB p95 latency, unhealthy hosts → SNS topic `skybroe-alerts` (email on `alarm_email`) |
-| Logs | CloudWatch log groups `/skybroe/app` (30 d) and `/skybroe/system` (14 d); CloudWatch agent config in SSM |
+| Dashboard | `SkyBroe-Overview` — EC2 CPU/mem/disk/network and live app-log query widgets |
+| Alarms | CPU, memory, disk, EC2 status check → SNS topic `skybroe-alerts` (email on `alarm_email`) |
+| Logs | CloudWatch log groups `/skybroe/app` and `/skybroe/system` (14 d); CloudWatch agent config in SSM |
 | RUM | CloudWatch RUM app monitor `skybroe-web` with a Cognito guest identity pool for browser telemetry |
-| ALB access logs | Shipped to S3 bucket `skybroe-alb-logs-<account>`, expired after 90 days |
 
 ### First-time setup
 
@@ -543,9 +556,9 @@ Every free / near-zero-cost resource (networking, IAM, ACM, target groups, liste
 5. Add all remaining GitHub Secrets listed above
 6. Push to `main` — the pipeline provisions the server and deploys the app
 
-**With Route53 (`HOSTED_ZONE_ID` set):** DNS validation and A records are created automatically.
+**With Route53 (`HOSTED_ZONE_ID` set):** the apex and `www` A records are created automatically.
 
-**Without Route53:** Check `terraform output acm_validation_records`, add the CNAMEs at your registrar, then re-run the workflow.
+**Without Route53:** add A records for `APP_DOMAIN` and `www.APP_DOMAIN` pointing at the Elastic IP (see `terraform output dns_records`) **before** the first deploy — Caddy needs them to resolve to obtain its certificate.
 
 ### Manual infra operations
 

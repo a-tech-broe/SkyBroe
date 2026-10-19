@@ -1,0 +1,22 @@
+# Caddy — TLS termination + routing on the app instance (replaces the ALB).
+# Certificates come from Let's Encrypt automatically and persist in the
+# caddy_data volume, so redeploys don't re-issue (or hit rate limits).
+# APP_DOMAIN comes from /opt/skybroe/.env via docker-compose.prod.yml.
+
+{$APP_DOMAIN} {
+	encode zstd gzip
+
+	# API + health check → Node backend; everything else → nginx SPA.
+	@backend path /api/* /health
+	handle @backend {
+		reverse_proxy backend:3001
+	}
+
+	handle {
+		reverse_proxy web:8080
+	}
+}
+
+www.{$APP_DOMAIN} {
+	redir https://{$APP_DOMAIN}{uri} permanent
+}
