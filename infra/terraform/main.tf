@@ -161,6 +161,28 @@ resource "aws_security_group" "skybroe" {
   }
 }
 
+# ── App subnet — an AZ that actually offers var.instance_type ─────
+# Not every AZ carries every type (e.g. t3 is absent from us-east-1e), and an
+# unpinned launch can land in one that doesn't, failing the apply.
+data "aws_ec2_instance_type_offerings" "app" {
+  location_type = "availability-zone"
+  filter {
+    name   = "instance-type"
+    values = [var.instance_type]
+  }
+}
+
+data "aws_subnets" "app" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+  filter {
+    name   = "availability-zone"
+    values = data.aws_ec2_instance_type_offerings.app.locations
+  }
+}
+
 # ── EC2 instance ──────────────────────────────────────────────────
 resource "aws_instance" "skybroe" {
   ami                    = data.aws_ami.al2023.id
@@ -168,6 +190,7 @@ resource "aws_instance" "skybroe" {
   key_name               = var.key_name
   iam_instance_profile   = aws_iam_instance_profile.skybroe_ec2.name
   vpc_security_group_ids = [aws_security_group.skybroe.id]
+  subnet_id              = sort(data.aws_subnets.app.ids)[0]
 
   root_block_device {
     volume_type = "gp3"
@@ -196,7 +219,9 @@ resource "aws_instance" "skybroe" {
 
   lifecycle {
     prevent_destroy = true
-    ignore_changes  = [ami, user_data]
+    # subnet_id: a later instance_type change may shift the eligible AZs;
+    # moving subnets would force a replacement that prevent_destroy blocks.
+    ignore_changes = [ami, user_data, subnet_id]
   }
 }
 
