@@ -124,11 +124,22 @@ jobs:
 
           # ACM DNS-validation CNAMEs — only for SkyBroe's own certificate
           # (tagged Name=skybroe-cert). Other projects can hold certificates
-          # for the same domain; their validation records must survive or
-          # their certificates stop auto-renewing.
-          for CERT_ARN in $(aws acm list-certificates \
+          # for the same domain, and ACM reuses one validation CNAME per
+          # domain name across an account's certificates, so any CNAME that a
+          # foreign certificate also uses must survive or it stops renewing.
+          CERT_ARNS=$(aws acm list-certificates \
             --query "CertificateSummaryList[?DomainName=='$DOMAIN'].CertificateArn" \
-            --output text 2>/dev/null || true); do
+            --output text 2>/dev/null || true)
+          FOREIGN_CNAMES=""
+          for CERT_ARN in $CERT_ARNS; do
+            CERT_NAME=$(aws acm list-tags-for-certificate --certificate-arn "$CERT_ARN" \
+              --query "Tags[?Key=='Name'].Value | [0]" --output text 2>/dev/null || true)
+            [ "$CERT_NAME" = "skybroe-cert" ] && continue
+            FOREIGN_CNAMES="$FOREIGN_CNAMES $(aws acm describe-certificate --certificate-arn "$CERT_ARN" \
+              --query "Certificate.DomainValidationOptions[].ResourceRecord.Name" --output text 2>/dev/null || true)"
+          done
+
+          for CERT_ARN in $CERT_ARNS; do
             CERT_NAME=$(aws acm list-tags-for-certificate --certificate-arn "$CERT_ARN" \
               --query "Tags[?Key=='Name'].Value | [0]" --output text 2>/dev/null || true)
             if [ "$CERT_NAME" != "skybroe-cert" ]; then
@@ -144,7 +155,9 @@ jobs:
               TYPE=$(echo "$rec" | jq -r '.Type')
               BATCH=$(jq -n --arg n "$NAME" --arg v "$VALUE" --arg t "$TYPE" \
                 '{Changes:[{Action:"DELETE",ResourceRecordSet:{Name:$n,Type:$t,TTL:60,ResourceRecords:[{Value:$v}]}}]}')
-              if [ "$DRY_RUN" = "true" ]; then
+              if printf '%s\n' $FOREIGN_CNAMES | grep -qxF "$NAME"; then
+                echo "SKIP — validation CNAME $NAME is shared with another project's certificate"
+              elif [ "$DRY_RUN" = "true" ]; then
                 echo "[DRY RUN] Would delete ACM validation CNAME: $NAME"
               else
                 aws route53 change-resource-record-sets \

@@ -13,6 +13,19 @@ resource "aws_route53_record" "app" {
   allow_overwrite = true
 }
 
+# ── Retired ACM validation records — forget, never delete ──────────
+# ACM reuses the same validation CNAME for a domain name across every
+# certificate in the account, and another project's certificate covers this
+# domain too. Destroying these with the old ACM cert would break that
+# certificate's auto-renewal, so drop them from state and leave the records.
+removed {
+  from = aws_route53_record.cert_validation
+
+  lifecycle {
+    destroy = false
+  }
+}
+
 resource "aws_route53_record" "app_www" {
   count           = var.hosted_zone_id != "" ? 1 : 0
   zone_id         = var.hosted_zone_id
