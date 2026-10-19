@@ -437,7 +437,7 @@ Two workflows cover the full DevSecOps lifecycle.
 
 ### `cd.yml` — merge to `main` / version tags
 
-Runs all security gates, then:
+Runs all security gates (the dependency audit here blocks on **high**, scoped to shipped dependencies with `--omit=dev`), then:
 
 | Job | What happens |
 |---|---|

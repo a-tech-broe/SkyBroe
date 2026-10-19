@@ -66,6 +66,9 @@ jobs:
           category: semgrep
 
   # ── 3. Dependency audit — stricter in prod ────────────────────────
+  # Gates on HIGH, but only for dependencies that ship: the web image is
+  # static files served by nginx, so its devDependencies (Vite, Tailwind)
+  # never reach production. CI still audits everything at CRITICAL.
   audit:
     name: Dependency Audit
     runs-on: ubuntu-latest
@@ -77,10 +80,10 @@ jobs:
           node-version: '22'
 
       - name: Audit backend
-        run: cd app/backend && npm ci && npm audit --audit-level=high
+        run: cd app/backend && npm ci && npm audit --omit=dev --audit-level=high
 
       - name: Audit web
-        run: cd app/web && npm ci && npm audit --audit-level=high
+        run: cd app/web && npm ci && npm audit --omit=dev --audit-level=high
 
   # ── 4. Build · push · scan · sign per service ────────────────────
   build-push:
