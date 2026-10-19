@@ -1,6 +1,8 @@
 # ── Data ──────────────────────────────────────────────────────────
 data "aws_caller_identity" "current" {}
-data "aws_elb_service_account" "main" {}
+
+# Everything here stays inside the CloudWatch free tier for an MVP:
+# ≤ 10 alarms, ≤ 10 custom metrics, ≤ 3 dashboards, and a few MB of logs.
 
 # ── SNS — alert notifications ──────────────────────────────────────
 resource "aws_sns_topic" "alerts" {
@@ -18,7 +20,7 @@ resource "aws_sns_topic_subscription" "email" {
 # ── CloudWatch Log Groups ─────────────────────────────────────────
 resource "aws_cloudwatch_log_group" "app" {
   name              = "/skybroe/app"
-  retention_in_days = 30
+  retention_in_days = 14
   tags              = local.protect
 }
 
@@ -26,36 +28,6 @@ resource "aws_cloudwatch_log_group" "system" {
   name              = "/skybroe/system"
   retention_in_days = 14
   tags              = local.protect
-}
-
-# ── ALB Access Logs → S3 ─────────────────────────────────────────
-resource "aws_s3_bucket" "alb_logs" {
-  bucket        = "skybroe-alb-logs-${data.aws_caller_identity.current.account_id}"
-  force_destroy = true
-  tags          = local.protect
-}
-
-resource "aws_s3_bucket_lifecycle_configuration" "alb_logs" {
-  bucket = aws_s3_bucket.alb_logs.id
-  rule {
-    id     = "expire-90d"
-    status = "Enabled"
-    filter { prefix = "" }
-    expiration { days = 90 }
-  }
-}
-
-resource "aws_s3_bucket_policy" "alb_logs" {
-  bucket = aws_s3_bucket.alb_logs.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { AWS = data.aws_elb_service_account.main.arn }
-      Action    = "s3:PutObject"
-      Resource  = "${aws_s3_bucket.alb_logs.arn}/AWSLogs/${data.aws_caller_identity.current.account_id}/*"
-    }]
-  })
 }
 
 # ── CloudWatch Agent config in SSM ───────────────────────────────
@@ -69,14 +41,14 @@ resource "aws_ssm_parameter" "cw_agent_config" {
     }
     metrics = {
       append_dimensions = { InstanceId = "$${aws:InstanceId}" }
+      # Two custom metrics only (mem + disk) — both feed alarms, and the
+      # first 10 custom metrics are free.
       metrics_collected = {
         mem = { measurement = ["mem_used_percent"] }
         # drop_device: the root device name differs by instance family
         # (xvda1 on Xen, nvme0n1p1 on Nitro), so keep it out of the dimensions
         # the disk alarm and dashboard must match.
-        disk    = { measurement = ["disk_used_percent"], resources = ["/"], drop_device = true }
-        diskio  = { measurement = ["io_time", "write_bytes", "read_bytes"], resources = ["*"] }
-        netstat = { measurement = ["tcp_established", "tcp_time_wait"] }
+        disk = { measurement = ["disk_used_percent"], resources = ["/"], drop_device = true }
       }
     }
     logs = {
@@ -96,6 +68,7 @@ resource "aws_ssm_parameter" "cw_agent_config" {
 }
 
 # ── SSM Associations — install + configure CloudWatch Agent ───────
+# Requires the instance role's AmazonSSMManagedInstanceCore attachment.
 resource "aws_ssm_association" "cw_agent_install" {
   name = "AWS-ConfigureAWSPackage"
   targets {
@@ -238,57 +211,24 @@ resource "aws_cloudwatch_metric_alarm" "disk_high" {
   tags = local.protect
 }
 
-resource "aws_cloudwatch_metric_alarm" "alb_5xx" {
-  alarm_name          = "skybroe-alb-5xx"
-  alarm_description   = "More than 10 backend 5xx in 1 min"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "HTTPCode_Target_5XX_Count"
-  namespace           = "AWS/ApplicationELB"
-  period              = 60
-  statistic           = "Sum"
-  threshold           = 10
-  treat_missing_data  = "notBreaching"
-  alarm_actions       = [aws_sns_topic.alerts.arn]
-  ok_actions          = [aws_sns_topic.alerts.arn]
-  dimensions          = { LoadBalancer = aws_lb.skybroe.arn_suffix }
-  tags                = local.protect
-}
-
-resource "aws_cloudwatch_metric_alarm" "alb_latency" {
-  alarm_name          = "skybroe-alb-latency"
-  alarm_description   = "ALB p95 response time > 3s for 2 min"
+# Replaces the ALB health-check alarms: with a single instance and no load
+# balancer, a failed EC2 status check is the "site is down" signal. (EC2's
+# default simplified auto-recovery handles underlying host failures.)
+resource "aws_cloudwatch_metric_alarm" "status_check" {
+  alarm_name          = "skybroe-status-check-failed"
+  alarm_description   = "EC2 instance or system status check failing for 2 min"
   comparison_operator = "GreaterThanThreshold"
   evaluation_periods  = 2
-  metric_name         = "TargetResponseTime"
-  namespace           = "AWS/ApplicationELB"
-  period              = 60
-  extended_statistic  = "p95"
-  threshold           = 3
-  treat_missing_data  = "notBreaching"
-  alarm_actions       = [aws_sns_topic.alerts.arn]
-  dimensions          = { LoadBalancer = aws_lb.skybroe.arn_suffix }
-  tags                = local.protect
-}
-
-resource "aws_cloudwatch_metric_alarm" "alb_unhealthy" {
-  alarm_name          = "skybroe-alb-unhealthy-hosts"
-  alarm_description   = "One or more backend targets unhealthy"
-  comparison_operator = "GreaterThanThreshold"
-  evaluation_periods  = 1
-  metric_name         = "UnHealthyHostCount"
-  namespace           = "AWS/ApplicationELB"
+  metric_name         = "StatusCheckFailed"
+  namespace           = "AWS/EC2"
   period              = 60
   statistic           = "Maximum"
   threshold           = 0
   treat_missing_data  = "notBreaching"
   alarm_actions       = [aws_sns_topic.alerts.arn]
   ok_actions          = [aws_sns_topic.alerts.arn]
-  dimensions = {
-    LoadBalancer = aws_lb.skybroe.arn_suffix
-    TargetGroup  = aws_lb_target_group.backend.arn_suffix
-  }
-  tags = local.protect
+  dimensions          = { InstanceId = aws_instance.skybroe.id }
+  tags                = local.protect
 }
 
 # ── CloudWatch Dashboard ──────────────────────────────────────────
@@ -347,62 +287,9 @@ resource "aws_cloudwatch_dashboard" "skybroe" {
           ]
         }
       },
-      # Row 2 — ALB
+      # Row 2+ — App logs
       {
-        type = "metric", x = 0, y = 6, width = 6, height = 6
-        properties = {
-          title   = "Request Count"
-          region  = var.aws_region
-          view    = "timeSeries"
-          period  = 60
-          stat    = "Sum"
-          metrics = [["AWS/ApplicationELB", "RequestCount", "LoadBalancer", aws_lb.skybroe.arn_suffix]]
-        }
-      },
-      {
-        type = "metric", x = 6, y = 6, width = 6, height = 6
-        properties = {
-          title  = "Response Time (s)"
-          region = var.aws_region
-          view   = "timeSeries"
-          period = 60
-          metrics = [
-            ["AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", aws_lb.skybroe.arn_suffix, { stat = "p50", label = "p50" }],
-            ["AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", aws_lb.skybroe.arn_suffix, { stat = "p95", label = "p95" }],
-            ["AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", aws_lb.skybroe.arn_suffix, { stat = "p99", label = "p99" }]
-          ]
-        }
-      },
-      {
-        type = "metric", x = 12, y = 6, width = 6, height = 6
-        properties = {
-          title  = "HTTP Status Codes"
-          region = var.aws_region
-          view   = "timeSeries"
-          period = 60
-          metrics = [
-            ["AWS/ApplicationELB", "HTTPCode_Target_2XX_Count", "LoadBalancer", aws_lb.skybroe.arn_suffix, { stat = "Sum", label = "2xx" }],
-            ["AWS/ApplicationELB", "HTTPCode_Target_4XX_Count", "LoadBalancer", aws_lb.skybroe.arn_suffix, { stat = "Sum", label = "4xx" }],
-            ["AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "LoadBalancer", aws_lb.skybroe.arn_suffix, { stat = "Sum", label = "5xx" }]
-          ]
-        }
-      },
-      {
-        type = "metric", x = 18, y = 6, width = 6, height = 6
-        properties = {
-          title  = "Active / New Connections"
-          region = var.aws_region
-          view   = "timeSeries"
-          period = 60
-          metrics = [
-            ["AWS/ApplicationELB", "ActiveConnectionCount", "LoadBalancer", aws_lb.skybroe.arn_suffix, { stat = "Sum", label = "Active" }],
-            ["AWS/ApplicationELB", "NewConnectionCount", "LoadBalancer", aws_lb.skybroe.arn_suffix, { stat = "Sum", label = "New" }]
-          ]
-        }
-      },
-      # Row 3 — App logs
-      {
-        type = "log", x = 0, y = 12, width = 24, height = 6
+        type = "log", x = 0, y = 6, width = 24, height = 6
         properties = {
           title  = "API Requests (last 1h)"
           region = var.aws_region
@@ -411,7 +298,7 @@ resource "aws_cloudwatch_dashboard" "skybroe" {
         }
       },
       {
-        type = "log", x = 0, y = 18, width = 24, height = 6
+        type = "log", x = 0, y = 12, width = 24, height = 6
         properties = {
           title  = "Errors & 5xx (last 1h)"
           region = var.aws_region
@@ -420,7 +307,7 @@ resource "aws_cloudwatch_dashboard" "skybroe" {
         }
       },
       {
-        type = "log", x = 0, y = 24, width = 12, height = 6
+        type = "log", x = 0, y = 18, width = 12, height = 6
         properties = {
           title  = "Top Endpoints (last 1h)"
           region = var.aws_region
@@ -429,7 +316,7 @@ resource "aws_cloudwatch_dashboard" "skybroe" {
         }
       },
       {
-        type = "log", x = 12, y = 24, width = 12, height = 6
+        type = "log", x = 12, y = 18, width = 12, height = 6
         properties = {
           title  = "Active Users (last 1h)"
           region = var.aws_region

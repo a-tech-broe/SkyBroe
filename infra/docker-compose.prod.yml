@@ -1,11 +1,31 @@
 # Production compose — runs pre-built DockerHub images (no source build).
-# Reference copy of what runs on EC2: the deploy job in .github/workflows/cd.yml
-# writes this same file to /opt/skybroe — keep the two in sync.
+# This file and the Caddyfile beside it are what run on EC2: the deploy job in
+# .github/workflows/cd.yml copies both to /opt/skybroe and writes .env.
 # Requires .env with: DB_USER, DB_PASSWORD, JWT_SECRET, FAA_CLIENT_ID,
 #                     FAA_CLIENT_SECRET, ANTHROPIC_API_KEY, DOCKERHUB_USERNAME,
-#                     IMAGE_TAG, AWS_REGION, APP_URL, SES_FROM_EMAIL
+#                     IMAGE_TAG, AWS_REGION, APP_DOMAIN, APP_URL, SES_FROM_EMAIL
+#
+# Only Caddy publishes host ports (80/443); backend and web are reachable
+# solely on the compose network.
 
 services:
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    depends_on:
+      - backend
+      - web
+    environment:
+      APP_DOMAIN: ${APP_DOMAIN}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
   db:
     image: postgres:16-alpine
     restart: unless-stopped
@@ -45,8 +65,6 @@ services:
         awslogs-group: /skybroe/app
         awslogs-stream: backend
         awslogs-create-group: "true"
-    ports:
-      - "3001:3001"
 
   web:
     image: ${DOCKERHUB_USERNAME}/skybroe-web:${IMAGE_TAG:-latest}
@@ -60,8 +78,8 @@ services:
         awslogs-group: /skybroe/app
         awslogs-stream: web
         awslogs-create-group: "true"
-    ports:
-      - "80:8080"
 
 volumes:
   pgdata:
+  caddy_data:
+  caddy_config:

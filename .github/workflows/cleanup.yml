@@ -391,6 +391,7 @@ jobs:
 
           # CloudWatch metric alarms
           for A in skybroe-cpu-high skybroe-memory-high skybroe-disk-high \
+                   skybroe-status-check-failed \
                    skybroe-alb-5xx skybroe-alb-latency skybroe-alb-unhealthy-hosts; do
             EXISTS=$(aws cloudwatch describe-alarms --alarm-names "$A" \
               --query "MetricAlarms[0].AlarmName" --output text 2>/dev/null || true)
@@ -656,9 +657,9 @@ jobs:
 
           **Resources always skipped:** Elastic IPs (pre-allocated, managed outside Terraform).
           **Other skips:** any resource tagged \`do_not_delete=true\` — this covers all networking, IAM,
-          and observability scaffolding (IGW, security groups, ACM cert, log groups, SNS, RUM, Cognito,
-          S3 logs bucket, alarms). A normal teardown therefore destroys only the cost-incurring EC2
-          instance and ALB, leaving the free scaffolding intact.
+          and observability scaffolding (security groups, log groups, SNS, RUM, Cognito, alarms).
+          A normal teardown therefore destroys only the cost-incurring EC2 instance, leaving the free
+          scaffolding intact. (The ALB / ACM phases only clean up leftovers from the pre-MVP design.)
 
           To re-provision, run the CD workflow from \`main\`.
           EOF

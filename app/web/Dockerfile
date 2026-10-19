@@ -1,5 +1,7 @@
 # -------- BUILD STAGE --------
-    FROM node:22-alpine AS builder
+    # Runs on the build machine's native platform: the output is static
+    # files, so the arm64 image doesn't need a slow QEMU-emulated Vite build.
+    FROM --platform=$BUILDPLATFORM node:22-alpine AS builder
 
     WORKDIR /app
     
