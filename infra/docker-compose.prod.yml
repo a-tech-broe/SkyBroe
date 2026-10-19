@@ -1,7 +1,9 @@
 # Production compose — runs pre-built DockerHub images (no source build).
-# Used by the deploy workflow and as the reference for what runs on EC2.
-# Requires .env with: DB_USER, DB_PASSWORD, FAA_CLIENT_ID, FAA_CLIENT_SECRET,
-#                     ANTHROPIC_API_KEY, DOCKERHUB_USERNAME, IMAGE_TAG, VITE_API_URL
+# Reference copy of what runs on EC2: the deploy job in .github/workflows/cd.yml
+# writes this same file to /opt/skybroe — keep the two in sync.
+# Requires .env with: DB_USER, DB_PASSWORD, JWT_SECRET, FAA_CLIENT_ID,
+#                     FAA_CLIENT_SECRET, ANTHROPIC_API_KEY, DOCKERHUB_USERNAME,
+#                     IMAGE_TAG, AWS_REGION, APP_URL, SES_FROM_EMAIL
 
 services:
   db:
@@ -18,7 +20,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    networks: [skybroe]
 
   backend:
     image: ${DOCKERHUB_USERNAME}/skybroe-backend:${IMAGE_TAG:-latest}
@@ -31,25 +32,36 @@ services:
       PORT: 3001
       DB_URL: postgresql://${DB_USER}:${DB_PASSWORD}@db:5432/skybroe
       FAA_CLIENT_ID: ${FAA_CLIENT_ID}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
       FAA_CLIENT_SECRET: ${FAA_CLIENT_SECRET}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      JWT_SECRET: ${JWT_SECRET}
+      AWS_REGION: ${AWS_REGION}
+      APP_URL: ${APP_URL}
+      SES_FROM_EMAIL: ${SES_FROM_EMAIL}
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: /skybroe/app
+        awslogs-stream: backend
+        awslogs-create-group: "true"
     ports:
       - "3001:3001"
-    networks: [skybroe]
 
   web:
     image: ${DOCKERHUB_USERNAME}/skybroe-web:${IMAGE_TAG:-latest}
     restart: unless-stopped
     depends_on:
       - backend
+    logging:
+      driver: awslogs
+      options:
+        awslogs-region: ${AWS_REGION}
+        awslogs-group: /skybroe/app
+        awslogs-stream: web
+        awslogs-create-group: "true"
     ports:
       - "80:8080"
-    networks: [skybroe]
 
 volumes:
   pgdata:
-
-networks:
-  skybroe:
-    name: skybroe_default
-    driver: bridge

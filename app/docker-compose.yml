@@ -1,5 +1,3 @@
-version: '3.9'
-
 services:
   db:
     image: postgres:16-alpine
@@ -30,6 +28,11 @@ services:
       FAA_CLIENT_ID: ${FAA_CLIENT_ID:-}
       FAA_CLIENT_SECRET: ${FAA_CLIENT_SECRET:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # NODE_ENV=production makes the backend refuse to boot without a JWT secret.
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      APP_URL: ${APP_URL:-http://localhost}
+      SES_FROM_EMAIL: ${SES_FROM_EMAIL:-}
     ports:
       - "3001:3001"
     depends_on:
@@ -44,7 +47,7 @@ services:
         VITE_API_URL: ${VITE_API_URL:-http://localhost:3001}
     restart: unless-stopped
     ports:
-      - "80:80"
+      - "80:8080"
     depends_on:
       - backend
 

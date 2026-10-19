@@ -7,13 +7,13 @@ variable "aws_region" {
 variable "instance_type" {
   description = "EC2 instance type"
   type        = string
-  default     = "m5.xlarge"
+  default     = "t3.medium"
 }
 
 variable "key_name" {
   description = "Name of an existing EC2 key pair for SSH access"
   type        = string
-  default = "keyit"
+  default     = "keyit"
 }
 
 variable "allowed_ssh_cidr" {

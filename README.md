@@ -381,9 +381,8 @@ SkyBroe/
 ### Dev
 
 ```bash
-# Copy and fill in your env vars
-cp .env .env.local           # or create app/.env from scratch
-# Required: FAA_CLIENT_ID, FAA_CLIENT_SECRET, DB_USER, DB_PASSWORD, ANTHROPIC_API_KEY
+# Create app/.env with your API keys (dev uses built-in DB creds and a dev JWT fallback)
+# Needed for full functionality: FAA_CLIENT_ID, FAA_CLIENT_SECRET, ANTHROPIC_API_KEY
 
 docker compose -f app/docker-compose.dev.yml up --build
 ```
@@ -397,8 +396,9 @@ docker compose -f app/docker-compose.dev.yml up --build
 ### Production (build from source)
 
 ```bash
-# Required: DB_PASSWORD, FAA_CLIENT_ID, FAA_CLIENT_SECRET, ANTHROPIC_API_KEY
-docker compose -f app/docker-compose.yml up --build -d
+# Required: JWT_SECRET (backend refuses to boot without it), DB_PASSWORD,
+#           FAA_CLIENT_ID, FAA_CLIENT_SECRET, ANTHROPIC_API_KEY
+docker compose -f app/docker-compose.yml up --build -d   # web on http://localhost
 ```
 
 ---
@@ -437,7 +437,7 @@ Two workflows cover the full DevSecOps lifecycle.
 
 ### `cd.yml` — merge to `main` / version tags
 
-Runs all security gates, then:
+Runs all security gates (the dependency audit here blocks on **high**, scoped to shipped dependencies with `--omit=dev`), then:
 
 | Job | What happens |
 |---|---|
@@ -476,6 +476,15 @@ Manually dispatched, with a typed `DESTROY` confirmation and **dry-run on by def
 | `EC2_SSH_KEY` | Private key content (PEM) for app EC2 |
 | `SEMGREP_APP_TOKEN` | Optional — enables Semgrep cloud dashboard |
 
+### GitHub Variables (optional)
+
+| Variable | Used by |
+|---|---|
+| `VITE_RUM_APP_ID` | CD web build — from `terraform output rum_app_monitor_id`; enables CloudWatch RUM |
+| `VITE_RUM_IDENTITY_POOL_ID` | CD web build — from `terraform output rum_identity_pool_id` |
+
+RUM stays disabled in the browser until both are set (the IDs only exist after the first `terraform apply`, so set them and re-run CD).
+
 ---
 
 ## Infrastructure
@@ -493,7 +502,7 @@ Application Load Balancer  (HTTPS :443 — TLS terminated)
    ├── /health ──────► App EC2 :3001
    └── /*      ──────► App EC2 :80    (nginx → React SPA)
 
-App EC2  (m5.xlarge)
+App EC2  (t3.medium)
 ├── web      :80
 └── backend  :3001
 ```
@@ -502,8 +511,8 @@ App EC2  (m5.xlarge)
 
 | Resource | Detail |
 |---|---|
-| App EC2 | Amazon Linux 2023, `m5.xlarge`, 30 GB gp3 encrypted |
-| ALB | Application Load Balancer — HTTP→HTTPS redirect, path-based routing, access logs → S3 |
+| App EC2 | Amazon Linux 2023, `t3.medium`, 30 GB gp3 encrypted |
+| ALB | Application Load Balancer in 2 AZs (the instance's + one more) — HTTP→HTTPS redirect, path-based routing, access logs → S3 |
 | ACM | TLS certificate for `APP_DOMAIN` — DNS validated |
 | Internet gateway | The default VPC's existing IGW, referenced as a **data source** (not created — a default VPC already has one) |
 | Security groups | ALB SG (80+443 public); App SG |
@@ -583,6 +592,9 @@ terraform apply  # provision
 | `GET` | `/api/airports/:icao/charts` | FAA d-TPP charts for AIRAC cycle |
 | `GET` | `/api/airports/:icao/alternates?radius=50` | Nearby airports within radius nm with METARs |
 | `GET` | `/api/winds/:icao` | Parsed FD winds aloft for station |
+| `GET` | `/api/map/metars` | METARs for the weather map |
+| `GET` | `/api/map/sigmets` | SIGMET GeoJSON for the weather map |
+| `GET` | `/api/map/tfrs` | TFR GeoJSON for the weather map |
 | `GET` | `/api/history?deviceId=&type=` | Recent ICAO searches for device |
 | `POST` | `/api/history` | Record a search event |
 | `POST` | `/api/voice/brief` | Generate AI plain-English briefing via Claude Haiku |
