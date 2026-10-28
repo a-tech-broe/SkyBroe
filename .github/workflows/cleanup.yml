@@ -35,6 +35,7 @@ jobs:
   cleanup:
     name: Destroy SkyBroe AWS Resources
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     env:
       AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -43,17 +44,24 @@ jobs:
 
     steps:
       # ── Guard ───────────────────────────────────────────────────────
+      # Inputs and the branch name go through env, never ${{ }} inside the
+      # script: interpolated text becomes shell code (script injection).
       - name: Validate confirmation
+        env:
+          CONFIRM:        ${{ inputs.confirm }}
+          CLEAN_TF_STATE: ${{ inputs.clean_tf_state }}
+          ACTOR:          ${{ github.actor }}
+          REF_NAME:       ${{ github.ref_name }}
         run: |
-          if [ "${{ inputs.confirm }}" != "DESTROY" ]; then
-            echo "::error::Confirmation must be exactly 'DESTROY'. Got: ${{ inputs.confirm }}"
+          if [ "$CONFIRM" != "DESTROY" ]; then
+            echo "::error::Confirmation must be exactly 'DESTROY'. Got: $CONFIRM"
             exit 1
           fi
           echo "Confirmation accepted."
           echo "Region   : $AWS_DEFAULT_REGION"
           echo "Dry run  : $DRY_RUN"
-          echo "Clean TF : ${{ inputs.clean_tf_state }}"
-          echo "Actor    : ${{ github.actor }}  Branch: ${{ github.ref_name }}"
+          echo "Clean TF : $CLEAN_TF_STATE"
+          echo "Actor    : $ACTOR  Branch: $REF_NAME"
 
       # ── Bootstrap — account ID + protected-ARN set ─────────────────
       - name: Resolve account + build protected-ARN list
@@ -674,6 +682,10 @@ jobs:
       # ── Summary ──────────────────────────────────────────────────────
       - name: Summary
         if: always()
+        env:
+          CLEAN_TF_STATE: ${{ inputs.clean_tf_state }}
+          ACTOR:          ${{ github.actor }}
+          REF_NAME:       ${{ github.ref_name }}
         run: |
           if [ "$DRY_RUN" = "true" ]; then
             MODE="Dry run — nothing deleted"
@@ -688,8 +700,8 @@ jobs:
           | --- | --- |
           | Mode | $MODE |
           | Region | \`$AWS_DEFAULT_REGION\` |
-          | TF state wiped | ${{ inputs.clean_tf_state }} |
-          | Triggered by | \`${{ github.actor }}\` on \`${{ github.ref_name }}\` |
+          | TF state wiped | $CLEAN_TF_STATE |
+          | Triggered by | \`$ACTOR\` on \`$REF_NAME\` |
 
           **Resources always skipped:** Elastic IPs (pre-allocated, managed outside Terraform).
           **Other skips:** any resource tagged \`do_not_delete=true\` — this covers all networking, IAM,
