@@ -1,13 +1,16 @@
 # Weekly version updates, opened against dev (merging dev deploys to prod via
 # main, so every bump still passes the CI gate). Minor/patch bumps are grouped
 # into one PR per ecosystem to keep the noise down; majors arrive individually.
-# Security updates are separate and immediate when enabled in repo settings.
+# A 7-day cooldown lets brand-new releases age before we take them (most
+# malicious publishes are caught and yanked within days). Security updates
+# are separate, skip the cooldown, and are immediate.
 version: 2
 
 updates:
   - package-ecosystem: npm
     directories: [/app/backend, /app/web, /app/mobile]
     target-branch: dev
+    cooldown: { default-days: 7 }
     schedule: { interval: weekly, day: monday }
     open-pull-requests-limit: 5
     groups:
@@ -17,6 +20,7 @@ updates:
   - package-ecosystem: docker
     directories: [/app/backend, /app/web]
     target-branch: dev
+    cooldown: { default-days: 7 }
     schedule: { interval: weekly, day: monday }
     groups:
       base-images:
@@ -25,6 +29,7 @@ updates:
   - package-ecosystem: docker-compose
     directory: /infra
     target-branch: dev
+    cooldown: { default-days: 7 }
     schedule: { interval: weekly, day: monday }
     groups:
       compose-images:
@@ -33,6 +38,7 @@ updates:
   - package-ecosystem: github-actions
     directory: /
     target-branch: dev
+    cooldown: { default-days: 7 }
     schedule: { interval: weekly, day: monday }
     groups:
       actions:
@@ -41,4 +47,5 @@ updates:
   - package-ecosystem: terraform
     directory: /infra/terraform
     target-branch: dev
+    cooldown: { default-days: 7 }
     schedule: { interval: monthly }

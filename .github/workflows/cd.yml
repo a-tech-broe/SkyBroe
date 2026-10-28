@@ -90,9 +90,12 @@ jobs:
         with:
           persist-credentials: false
 
-      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+      # No dependency cache in the release workflow: a cache written by a
+      # less-trusted run could otherwise poison what gets audited and shipped.
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
         with:
           node-version: '22'
+          package-manager-cache: false
 
       - name: Audit backend
         run: cd app/backend && npm ci && npm audit --omit=dev --audit-level=high
