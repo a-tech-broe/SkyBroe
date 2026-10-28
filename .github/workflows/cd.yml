@@ -11,11 +11,9 @@ on:
         type: boolean
         default: true
 
+# Read-only by default; each job is granted only what it needs.
 permissions:
   contents: read
-  security-events: write
-  id-token: write
-  packages: write
 
 concurrency:
   group: cd-${{ github.ref }}
@@ -26,15 +24,23 @@ jobs:
   secret-scan:
     name: Secret Scan (Gitleaks)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
           fetch-depth: 0
 
+      # Checksum-pinned: a tampered release asset fails here, not in the scan.
       - name: Install Gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
         run: |
-          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz \
-            | tar -xz gitleaks
+          curl -sSfL --retry 3 -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks && rm gitleaks.tar.gz
           sudo mv gitleaks /usr/local/bin/gitleaks
 
       - name: Run Gitleaks
@@ -44,10 +50,16 @@ jobs:
   sast:
     name: SAST (Semgrep)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
     container:
-      image: semgrep/semgrep
+      image: semgrep/semgrep:1.182.0@sha256:4a34048c04fef049f71665047f074cffb00cc3d89482f965a5cd151d589237af
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Run Semgrep
         run: |
@@ -59,7 +71,7 @@ jobs:
         env:
           SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
 
-      - uses: github/codeql-action/upload-sarif@v3
+      - uses: github/codeql-action/upload-sarif@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3.39.1
         if: always()
         with:
           sarif_file: semgrep.sarif
@@ -72,10 +84,13 @@ jobs:
   audit:
     name: Dependency Audit
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
 
@@ -89,26 +104,33 @@ jobs:
   build-push:
     name: Build · Push · Sign (${{ matrix.service }})
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: [secret-scan, sast, audit]
+    permissions:
+      contents: read
+      security-events: write   # Trivy SARIF upload
+      id-token: write          # keyless Cosign signing
     strategy:
       fail-fast: false
       matrix:
         service: [backend, web]
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Login to Docker Hub
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Docker metadata
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
         with:
           images: ${{ secrets.DOCKERHUB_USERNAME }}/skybroe-${{ matrix.service }}
           tags: |
@@ -126,7 +148,7 @@ jobs:
 
       - name: Build and push
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: ./app/${{ matrix.service }}
           file: ./app/${{ matrix.service }}/Dockerfile
@@ -147,7 +169,7 @@ jobs:
 
       - name: Trivy image scan
         id: trivy-image
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         continue-on-error: true
         with:
           image-ref: ${{ secrets.DOCKERHUB_USERNAME }}/skybroe-${{ matrix.service }}@${{ steps.build.outputs.digest }}
@@ -164,7 +186,7 @@ jobs:
           jq -e '.runs | length > 0' "$FILE" > /dev/null 2>&1 || \
             echo '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{"tool":{"driver":{"name":"Trivy","version":"0.0.0","informationUri":"https://github.com/aquasecurity/trivy","rules":[]}},"results":[]}]}' > "$FILE"
 
-      - uses: github/codeql-action/upload-sarif@v3
+      - uses: github/codeql-action/upload-sarif@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3.39.1
         if: always()
         with:
           sarif_file: trivy-image-${{ matrix.service }}.sarif
@@ -174,19 +196,39 @@ jobs:
         if: steps.trivy-image.outcome == 'failure'
         run: echo "::warning::Trivy found vulnerabilities in skybroe-${{ matrix.service }}. Review Security → Code scanning."
 
-      - name: Install Cosign
-        uses: sigstore/cosign-installer@v3
-
-      - name: Sign image (keyless OIDC)
+      # Release gate: a CRITICAL CVE that already has a fix blocks the deploy.
+      # Production runs the immutable sha-<commit> tag (see the deploy job),
+      # so a blocked image never reaches EC2 even though it was pushed.
+      # Accept a specific CVE only via .trivyignore, with a reason.
+      - name: Gate on fixable CRITICAL CVEs
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
-        run: |
-          cosign sign --yes \
-            "${{ secrets.DOCKERHUB_USERNAME }}/skybroe-${{ matrix.service }}@${{ steps.build.outputs.digest }}"
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ secrets.DOCKERHUB_USERNAME }}/skybroe-${{ matrix.service }}@${{ steps.build.outputs.digest }}
+          scanners: vuln
+          severity: CRITICAL
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+          format: table
+          exit-code: '1'
+          skip-setup-trivy: true
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@7e8b541eb2e61bf99390e1afd4be13a184e9ebc5 # v3.10.1
+
+      - name: Sign and verify image (keyless OIDC)
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
         env:
-          COSIGN_EXPERIMENTAL: '1'
+          IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/skybroe-${{ matrix.service }}@${{ steps.build.outputs.digest }}
+        run: |
+          cosign sign --yes "$IMAGE"
+          cosign verify "$IMAGE" \
+            --certificate-identity-regexp="^https://github.com/${GITHUB_REPOSITORY}/" \
+            --certificate-oidc-issuer=https://token.actions.githubusercontent.com > /dev/null
+          echo "Signature verified for $IMAGE"
 
       - name: Generate SBOM
-        uses: anchore/sbom-action@v0.18.0
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         continue-on-error: true
         with:
           image: ${{ secrets.DOCKERHUB_USERNAME }}/skybroe-${{ matrix.service }}@${{ steps.build.outputs.digest }}
@@ -199,6 +241,7 @@ jobs:
   infra-apply:
     name: Infra Apply (Terraform)
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     needs: [build-push]
     defaults:
       run:
@@ -213,9 +256,11 @@ jobs:
       TF_VAR_app_eip: ${{ secrets.EC2_HOST }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
         with:
           terraform_version: '1.8.5'
 
@@ -348,10 +393,10 @@ jobs:
           tf_import_if_missing aws_sesv2_email_identity.domain "$TF_VAR_domain_name"
 
       - name: Terraform Plan
-        run: terraform plan -out=tfplan -input=false
+        run: terraform plan -out=tfplan -input=false -lock-timeout=5m
 
       - name: Terraform Apply
-        run: terraform apply -auto-approve -input=false tfplan
+        run: terraform apply -auto-approve -input=false -lock-timeout=5m tfplan
 
       - name: Wait for EC2 instance to pass status checks
         run: |
@@ -372,6 +417,7 @@ jobs:
   deploy:
     name: Deploy to EC2
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     needs: [infra-apply]
 
     steps:
@@ -399,6 +445,19 @@ jobs:
           [ "$missing" -eq 0 ] || exit 1
           echo "All required secrets are present."
 
+      # Deploy the immutable per-commit tag that build-push scanned and signed,
+      # not :latest, so production runs exactly what passed the gates and a
+      # rollback has a concrete tag to return to. A no-push manual run has no
+      # new images, so it redeploys :latest.
+      - name: Resolve image tag
+        id: image
+        env:
+          PUSHED: ${{ github.event_name != 'workflow_dispatch' || inputs.push }}
+        run: |
+          if [ "$PUSHED" = "true" ]; then tag="sha-${GITHUB_SHA::7}"; else tag=latest; fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Deploying image tag: $tag"
+
       - name: Wait for SSH to be ready
         run: |
           for i in $(seq 1 24); do
@@ -411,27 +470,32 @@ jobs:
 
       # Ship the stack definition straight from the repo — the compose file
       # and Caddyfile in infra/ are the single source of truth for EC2.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
           sparse-checkout: infra
 
       - name: Copy compose file + Caddyfile to EC2
-        uses: appleboy/scp-action@v0.1.7
+        uses: appleboy/scp-action@ff85246acaad7bdce478db94a363cd2bf7c90345 # v1.0.0
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ec2-user
           key: ${{ secrets.EC2_SSH_KEY }}
+          # Optional host-key pin (SHA256:… from `ssh-keygen -lf`); unset = not checked.
+          fingerprint: ${{ secrets.EC2_SSH_FINGERPRINT }}
           source: infra/docker-compose.prod.yml,infra/Caddyfile
           target: /tmp/skybroe-deploy
           strip_components: 1
 
       - name: Write .env and restart containers
-        uses: appleboy/ssh-action@v1.2.0
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ec2-user
           key: ${{ secrets.EC2_SSH_KEY }}
-          envs: DOCKERHUB_USERNAME,DB_USER,DB_PASSWORD,JWT_SECRET,FAA_CLIENT_ID,FAA_CLIENT_SECRET,ANTHROPIC_API_KEY,AWS_REGION,APP_DOMAIN,APP_URL,SES_FROM_EMAIL
+          fingerprint: ${{ secrets.EC2_SSH_FINGERPRINT }}
+          command_timeout: 15m
+          envs: DOCKERHUB_USERNAME,DB_USER,DB_PASSWORD,JWT_SECRET,FAA_CLIENT_ID,FAA_CLIENT_SECRET,ANTHROPIC_API_KEY,AWS_REGION,APP_DOMAIN,APP_URL,SES_FROM_EMAIL,IMAGE_TAG
           script: |
             set -e
             # Install Docker + Compose plugin if not already present
@@ -449,6 +513,11 @@ jobs:
             sudo mkdir -p /opt/skybroe
             sudo install -m 0644 /tmp/skybroe-deploy/docker-compose.prod.yml /tmp/skybroe-deploy/Caddyfile /opt/skybroe/
             rm -rf /tmp/skybroe-deploy
+            cd /opt/skybroe
+            # Remember what is running now, so a failed release can roll back.
+            PREV_TAG=$(sudo sed -n 's/^IMAGE_TAG=//p' .env 2>/dev/null || true)
+            PREV_TAG=${PREV_TAG:-latest}
+            echo "Current tag: ${PREV_TAG} → new tag: ${IMAGE_TAG}"
             sudo tee /opt/skybroe/.env > /dev/null <<EOF
             DB_USER=${DB_USER}
             DB_PASSWORD=${DB_PASSWORD}
@@ -461,13 +530,22 @@ jobs:
             APP_DOMAIN=${APP_DOMAIN}
             APP_URL=${APP_URL}
             SES_FROM_EMAIL=${SES_FROM_EMAIL}
-            IMAGE_TAG=latest
+            IMAGE_TAG=${IMAGE_TAG}
             EOF
             sudo chmod 600 /opt/skybroe/.env
-            cd /opt/skybroe
-            sudo docker compose -f docker-compose.prod.yml pull
-            sudo docker compose -f docker-compose.prod.yml up -d --remove-orphans
-            sudo docker image prune -f
+            dc() { sudo docker compose -f docker-compose.prod.yml "$@"; }
+            # Docker Hub pulls fail transiently (rate limits, network) — retry.
+            for i in 1 2 3; do dc pull && break; [ "$i" = 3 ] && exit 1; echo "pull failed, retrying in 15s"; sleep 15; done
+            # --wait blocks until every service with a healthcheck is healthy.
+            if ! dc up -d --remove-orphans --wait --wait-timeout 180; then
+              echo "::error::Release ${IMAGE_TAG} failed its health checks — rolling back to ${PREV_TAG}"
+              dc logs --tail 50 backend || true
+              sudo sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=${PREV_TAG}/" .env
+              dc up -d --remove-orphans --wait --wait-timeout 180 || echo "::error::Rollback to ${PREV_TAG} is unhealthy too"
+              exit 1
+            fi
+            # Keep the disk small; unused images older than 3 days are re-pullable.
+            sudo docker image prune -af --filter "until=72h"
         env:
           DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
           DB_USER:            ${{ secrets.DB_USER }}
@@ -480,18 +558,20 @@ jobs:
           AWS_REGION:         ${{ secrets.AWS_REGION || 'us-east-1' }}
           APP_URL:            https://${{ secrets.APP_DOMAIN }}
           SES_FROM_EMAIL:     ${{ secrets.SES_FROM_EMAIL || format('noreply@{0}', secrets.APP_DOMAIN) }}
+          IMAGE_TAG:          ${{ steps.image.outputs.tag }}
 
   # ── 7. Production smoke test ──────────────────────────────────────
   smoke-prod:
     name: Production Smoke Test
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     needs: [deploy]
 
     steps:
       - name: API health check
         run: |
           # The backend only starts listening after Postgres is healthy and
-          # initDb() completes, then the ALB needs 2 passing checks before it
+          # initDb() completes, and Caddy must have its certificate before it
           # routes traffic — so poll until ready rather than guessing with a
           # fixed sleep. Up to 30 attempts × 10s = 5 min before giving up.
           for i in $(seq 1 30); do
@@ -520,7 +600,7 @@ jobs:
           exit 1
 
       # Data routes require a JWT, so an unauthenticated request should get a
-      # 401 from the backend — proving ALB → backend routing and the auth gate.
+      # 401 from the backend — proving Caddy → backend routing and the auth gate.
       - name: Weather API smoke test
         run: |
           CODE=$(curl -s -o /dev/null -w '%{http_code}' "https://${{ secrets.APP_DOMAIN }}/api/weather/metar/KORD")
@@ -539,6 +619,7 @@ jobs:
   summary:
     name: Release Summary
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     needs: [build-push, infra-apply, deploy, smoke-prod]
     if: always()
 
@@ -546,19 +627,19 @@ jobs:
       - name: Write summary
         run: |
           SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-          echo "## SkyBroe Release — \`$SHA\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Stage | Result |" >> $GITHUB_STEP_SUMMARY
-          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
-          echo "| Build & Push  | ${{ needs.build-push.result }}  |" >> $GITHUB_STEP_SUMMARY
-          echo "| Infra Apply   | ${{ needs.infra-apply.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Deploy        | ${{ needs.deploy.result }}      |" >> $GITHUB_STEP_SUMMARY
-          echo "| Smoke Test    | ${{ needs.smoke-prod.result }}  |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Verify signatures" >> $GITHUB_STEP_SUMMARY
-          echo '```bash' >> $GITHUB_STEP_SUMMARY
-          echo "cosign verify \\" >> $GITHUB_STEP_SUMMARY
-          echo "  --certificate-identity-regexp='https://github.com/${{ github.repository }}' \\" >> $GITHUB_STEP_SUMMARY
-          echo "  --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \\" >> $GITHUB_STEP_SUMMARY
-          echo "  ${{ secrets.DOCKERHUB_USERNAME }}/skybroe-backend:latest" >> $GITHUB_STEP_SUMMARY
-          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo "## SkyBroe Release — \`$SHA\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Stage | Result |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Build & Push  | ${{ needs.build-push.result }}  |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Infra Apply   | ${{ needs.infra-apply.result }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Deploy        | ${{ needs.deploy.result }}      |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Smoke Test    | ${{ needs.smoke-prod.result }}  |" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Verify signatures" >> "$GITHUB_STEP_SUMMARY"
+          echo '```bash' >> "$GITHUB_STEP_SUMMARY"
+          echo "cosign verify \\" >> "$GITHUB_STEP_SUMMARY"
+          echo "  --certificate-identity-regexp='https://github.com/${{ github.repository }}' \\" >> "$GITHUB_STEP_SUMMARY"
+          echo "  --certificate-oidc-issuer='https://token.actions.githubusercontent.com' \\" >> "$GITHUB_STEP_SUMMARY"
+          echo "  ${{ secrets.DOCKERHUB_USERNAME }}/skybroe-backend:latest" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"

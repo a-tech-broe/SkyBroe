@@ -423,7 +423,12 @@ docker compose -f app/docker-compose.yml up --build -d   # web on http://localho
 
 ## CI/CD Pipeline
 
-Two workflows cover the full DevSecOps lifecycle.
+Four workflows cover the full DevSecOps lifecycle. Every action is pinned to a
+full commit SHA (tag in a trailing comment), every job starts from read-only
+`GITHUB_TOKEN` permissions and is granted only what it needs, checkouts don't
+persist credentials, and Dependabot (`.github/dependabot.yml`) opens weekly
+update PRs against `dev` for npm, base images, compose images, actions and
+Terraform providers.
 
 ### `ci.yml` — every PR and `dev` push
 
@@ -442,13 +447,28 @@ Runs all security gates (the dependency audit here blocks on **high**, scoped to
 
 | Job | What happens |
 |---|---|
-| Build & push | Multi-arch (`amd64` + `arm64`) → DockerHub + Trivy scan + Cosign sign + SBOM |
+| Build & push | Multi-arch (`amd64` + `arm64`) → DockerHub + Trivy scan (**blocks** on a fixable CRITICAL CVE) + Cosign sign & verify + SBOM |
 | Infra apply | `terraform apply` — re-imports survivors, then provisions EC2, DNS records, SG, IAM, CloudWatch/RUM |
-| Deploy | SCP `infra/docker-compose.prod.yml` + `infra/Caddyfile` → app EC2, write `.env` → `docker compose up` |
+| Deploy | SCP `infra/docker-compose.prod.yml` + `infra/Caddyfile` → app EC2, write `.env` with the immutable `sha-<commit>` image tag → `docker compose up --wait`; if the backend healthcheck never passes, it **rolls back** to the previous tag and fails the run |
 | Production smoke test | HTTPS `curl` against `APP_DOMAIN`: `/health`, web HTML, weather and airport endpoints |
 | Summary | Release digest table + `cosign verify` instructions |
 
 On a state-loss recovery (e.g. after a teardown that wiped Terraform state), `infra apply` first re-imports every surviving `do_not_delete` resource so Terraform reconciles instead of colliding with existing infrastructure.
+
+### `security.yml` — PRs, pushes and weekly (Mondays)
+
+Free scanners; findings land in **Security → Code scanning**.
+
+| Job | Tool | Runs | Gate |
+|---|---|---|---|
+| SAST | CodeQL (`security-extended`, TypeScript + workflows) | PR / push / weekly | SARIF |
+| Dependency review | `actions/dependency-review-action` | PR | **Blocks** new runtime deps with HIGH+ CVEs or GPL/AGPL licences |
+| SCA | OSV-Scanner on all three lockfiles | PR / push / weekly | SARIF (npm audit is the gate) |
+| IaC | Trivy config (Terraform + Dockerfiles) | PR / push / weekly | **Blocks** on CRITICAL; accepted exceptions are justified in `.trivyignore` |
+| Workflow audit | zizmor (injection, permissions, unpinned actions) | PR / push / weekly | SARIF |
+| Deployed images | Trivy on the `:latest` images in production | weekly | SARIF — catches CVEs disclosed after release |
+| DAST | OWASP ZAP baseline (passive) against `https://APP_DOMAIN` | weekly | Report artifact |
+| Posture | OpenSSF Scorecard | `main` / weekly | SARIF |
 
 ### `cleanup.yml` — manual teardown
 
@@ -476,6 +496,7 @@ Manually dispatched, with a typed `DESTROY` confirmation and **dry-run on by def
 | `EC2_HOST` | App server Elastic IP — allocate before first deploy, set as secret |
 | `EC2_SSH_KEY` | Private key content (PEM) for app EC2 |
 | `SEMGREP_APP_TOKEN` | Optional — enables Semgrep cloud dashboard |
+| `EC2_SSH_FINGERPRINT` | Optional — pins the app server's SSH host key for deploys (`ssh-keyscan -t ed25519 <EC2_HOST> \| ssh-keygen -lf -`, the `SHA256:…` part) |
 
 ### GitHub Variables (optional)
 

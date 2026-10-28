@@ -6,10 +6,9 @@ on:
   push:
     branches: [dev]
 
+# Read-only by default; jobs that upload SARIF opt in to security-events.
 permissions:
   contents: read
-  security-events: write
-  pull-requests: read
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -20,15 +19,23 @@ jobs:
   secret-scan:
     name: Secret Scan (Gitleaks)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
           fetch-depth: 0
 
+      # Checksum-pinned: a tampered release asset fails here, not in the scan.
       - name: Install Gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
         run: |
-          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz \
-            | tar -xz gitleaks
+          curl -sSfL --retry 3 -o gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks && rm gitleaks.tar.gz
           sudo mv gitleaks /usr/local/bin/gitleaks
 
       - name: Run Gitleaks
@@ -38,18 +45,21 @@ jobs:
   lint:
     name: Lint & Type Check
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Lint Dockerfiles (Hadolint)
-        uses: hadolint/hadolint-action@v3.1.0
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
         with:
           recursive: true
           config: .hadolint.yaml
           failure-threshold: warning
           ignore: "DL3005 DL3008 DL3017 DL3018"
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
           cache: 'npm'
@@ -67,10 +77,13 @@ jobs:
   audit:
     name: Dependency Audit
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '22'
 
@@ -89,7 +102,7 @@ jobs:
       - name: Audit mobile
         run: cd app/mobile && npm ci && npm audit --audit-level=critical
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
           name: npm-audit-reports
@@ -100,10 +113,16 @@ jobs:
   sast:
     name: SAST (Semgrep)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
     container:
-      image: semgrep/semgrep
+      image: semgrep/semgrep:1.182.0@sha256:4a34048c04fef049f71665047f074cffb00cc3d89482f965a5cd151d589237af
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
       - name: Run Semgrep
         run: |
@@ -115,7 +134,7 @@ jobs:
         env:
           SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
 
-      - uses: github/codeql-action/upload-sarif@v3
+      - uses: github/codeql-action/upload-sarif@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3.39.1
         if: always()
         with:
           sarif_file: semgrep.sarif
@@ -125,18 +144,24 @@ jobs:
   build-and-scan:
     name: Build & Scan (${{ matrix.service }})
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     needs: [lint, audit]
+    permissions:
+      contents: read
+      security-events: write
     strategy:
       fail-fast: false
       matrix:
         service: [backend, web]
 
     steps:
-      - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Build image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: ./app/${{ matrix.service }}
           file: ./app/${{ matrix.service }}/Dockerfile
@@ -148,7 +173,7 @@ jobs:
           build-args: VITE_API_URL=http://localhost:3001
 
       - name: Trivy FS scan
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         continue-on-error: true
         with:
           scan-type: fs
@@ -165,7 +190,7 @@ jobs:
           jq -e '.runs | length > 0' "$FILE" > /dev/null 2>&1 || \
             echo '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{"tool":{"driver":{"name":"Trivy","version":"0.0.0","informationUri":"https://github.com/aquasecurity/trivy","rules":[]}},"results":[]}]}' > "$FILE"
 
-      - uses: github/codeql-action/upload-sarif@v3
+      - uses: github/codeql-action/upload-sarif@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3.39.1
         if: always()
         with:
           sarif_file: trivy-fs-${{ matrix.service }}.sarif
@@ -173,7 +198,7 @@ jobs:
 
       - name: Trivy image scan
         id: trivy-image
-        uses: aquasecurity/trivy-action@master
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         continue-on-error: true
         with:
           image-ref: skybroe-${{ matrix.service }}:ci
@@ -190,7 +215,7 @@ jobs:
           jq -e '.runs | length > 0' "$FILE" > /dev/null 2>&1 || \
             echo '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{"tool":{"driver":{"name":"Trivy","version":"0.0.0","informationUri":"https://github.com/aquasecurity/trivy","rules":[]}},"results":[]}]}' > "$FILE"
 
-      - uses: github/codeql-action/upload-sarif@v3
+      - uses: github/codeql-action/upload-sarif@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3.39.1
         if: always()
         with:
           sarif_file: trivy-image-${{ matrix.service }}.sarif
@@ -206,7 +231,7 @@ jobs:
           echo '{"version":"2.1.0","$schema":"https://json.schemastore.org/sarif-2.1.0.json","runs":[{"tool":{"driver":{"name":"Trivy","version":"0.0.0","informationUri":"https://github.com/aquasecurity/trivy","rules":[]}},"results":[]}]}' \
             > trivy-prod-${{ matrix.service }}.sarif
 
-      - uses: github/codeql-action/upload-sarif@v3
+      - uses: github/codeql-action/upload-sarif@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3.39.1
         if: always()
         with:
           sarif_file: trivy-prod-${{ matrix.service }}.sarif
@@ -216,6 +241,7 @@ jobs:
   infra-plan:
     name: Infra Plan
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     if: github.event_name == 'pull_request'
     needs: [secret-scan]
     defaults:
@@ -230,9 +256,11 @@ jobs:
       TF_VAR_hosted_zone_id: ${{ secrets.HOSTED_ZONE_ID }}
       TF_VAR_app_eip: ${{ secrets.EC2_HOST }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
 
-      - uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3.1.2
         with:
           terraform_version: '1.8.5'
 
@@ -249,4 +277,4 @@ jobs:
         run: terraform validate
 
       - name: Terraform Plan
-        run: terraform plan -input=false
+        run: terraform plan -input=false -lock-timeout=5m
