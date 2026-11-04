@@ -1,0 +1,265 @@
+name: Security Scans
+
+# Free, open-source scanners that complement the CI gate (Gitleaks, Semgrep,
+# npm audit, Trivy). Every finding lands in Security → Code scanning.
+#
+#   PRs + pushes     CodeQL · Dependency Review · OSV-Scanner · IaC · workflow audit
+#   Weekly schedule  all of the above, plus a rescan of the images running in
+#                    production (new CVEs appear after deploy), a passive OWASP
+#                    ZAP baseline against the live site, and OpenSSF Scorecard.
+#
+# Every action is pinned to a full commit SHA (the tag is in the trailing
+# comment) so a moved or hijacked tag cannot run code here. Dependabot keeps the
+# pins current — see .github/dependabot.yml.
+
+on:
+  pull_request:
+    branches: [main, dev]
+  push:
+    branches: [main, dev]
+  schedule:
+    - cron: '17 6 * * 1'   # Mondays 06:17 UTC
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # ── CodeQL — semantic SAST for TypeScript and for the workflows ───
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [javascript-typescript, actions]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: github/codeql-action/init@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3.39.1
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          queries: security-extended
+
+      - uses: github/codeql-action/analyze@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3.39.1
+        with:
+          category: codeql-${{ matrix.language }}
+
+  # ── Dependency Review — block PRs that add vulnerable packages ────
+  # Only diffs the PR's lockfile changes, so existing debt doesn't block
+  # unrelated work. Also rejects strong-copyleft licences.
+  dependency-review:
+    name: Dependency Review
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4.9.0
+        with:
+          fail-on-severity: high
+          fail-on-scopes: runtime
+          deny-licenses: AGPL-3.0-only, AGPL-3.0-or-later, GPL-3.0-only, GPL-3.0-or-later
+          comment-summary-in-pr: never
+
+  # ── OSV-Scanner — lockfiles vs. the OSV database ──────────────────
+  # Broader advisory coverage than npm audit (GHSA + OSV + ecosystem feeds).
+  # Report-only: npm audit in CI/CD is the gate, this is the second opinion.
+  osv-scanner:
+    name: OSV-Scanner
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Scan lockfiles
+        uses: google/osv-scanner-action/osv-scanner-action@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
+        continue-on-error: true
+        with:
+          scan-args: |-
+            --format=sarif
+            --output=osv.sarif
+            --lockfile=app/backend/package-lock.json
+            --lockfile=app/web/package-lock.json
+            --lockfile=app/mobile/package-lock.json
+
+      - uses: github/codeql-action/upload-sarif@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3.39.1
+        if: always() && hashFiles('osv.sarif') != ''
+        with:
+          sarif_file: osv.sarif
+          category: osv-scanner
+
+  # ── IaC — Terraform and Dockerfile misconfigurations ──────────────
+  # Fails on CRITICAL. Deliberate exceptions live in .trivyignore with a reason.
+  iac:
+    name: IaC Scan (Trivy config)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Trivy config scan (report)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          skip-dirs: '**/node_modules'
+          trivyignores: .trivyignore
+          format: sarif
+          output: trivy-iac.sarif
+          exit-code: '0'
+
+      - uses: github/codeql-action/upload-sarif@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3.39.1
+        if: always() && hashFiles('trivy-iac.sarif') != ''
+        with:
+          sarif_file: trivy-iac.sarif
+          category: trivy-iac
+
+      - name: Trivy config scan (gate on CRITICAL)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: .
+          skip-dirs: '**/node_modules'
+          trivyignores: .trivyignore
+          severity: CRITICAL
+          format: table
+          exit-code: '1'
+          skip-setup-trivy: true
+
+  # ── Workflow audit — injection, excessive permissions, unpinned uses
+  zizmor:
+    name: Workflow Audit (zizmor)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: zizmorcore/zizmor-action@53290badfa369cb0bf7ad16342cb62c2fa47ac7b # v0.8.0
+        with:
+          advanced-security: true
+
+  # ── Production image rescan — weekly ──────────────────────────────
+  # The CD scan only sees CVEs known on release day. This rescans the image
+  # tags actually deployed, so a newly disclosed CVE surfaces within a week.
+  deployed-images:
+    name: Rescan deployed image (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [backend, web]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        continue-on-error: true
+        with:
+          image-ref: ${{ secrets.DOCKERHUB_USERNAME }}/skybroe-${{ matrix.service }}:latest
+          scanners: vuln
+          ignore-unfixed: true
+          trivyignores: .trivyignore
+          format: sarif
+          output: trivy-deployed-${{ matrix.service }}.sarif
+          exit-code: '0'
+        env:
+          TRIVY_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          TRIVY_PASSWORD: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: github/codeql-action/upload-sarif@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3.39.1
+        if: always() && hashFiles(format('trivy-deployed-{0}.sarif', matrix.service)) != ''
+        with:
+          sarif_file: trivy-deployed-${{ matrix.service }}.sarif
+          category: trivy-deployed-${{ matrix.service }}
+
+  # ── DAST — passive OWASP ZAP baseline against the live site ───────
+  # Spiders for a minute and only *observes* responses (headers, cookies,
+  # info leaks); it sends no attack payloads. Report-only.
+  zap-baseline:
+    name: DAST (OWASP ZAP baseline)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Require APP_DOMAIN
+        env:
+          APP_DOMAIN: ${{ secrets.APP_DOMAIN }}
+        run: |
+          [ -n "$APP_DOMAIN" ] || { echo "::error::APP_DOMAIN secret is not set"; exit 1; }
+
+      - uses: zaproxy/action-baseline@de8ad967d3548d44ef623df22cf95c3b0baf8b25 # v0.15.0
+        with:
+          target: https://${{ secrets.APP_DOMAIN }}
+          cmd_options: '-m 1'
+          allow_issue_writing: false
+          fail_action: false
+          artifact_name: zap-baseline-report
+
+  # ── OpenSSF Scorecard — repo security posture, weekly ─────────────
+  # Must run on the default branch to publish.
+  scorecard:
+    name: OpenSSF Scorecard
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write
+      id-token: write
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - uses: ossf/scorecard-action@fa7117db83c52d787ae5a89f350999701505d78e # v2.5.0
+        with:
+          results_file: scorecard.sarif
+          results_format: sarif
+          publish_results: true
+
+      - uses: github/codeql-action/upload-sarif@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3.39.1
+        with:
+          sarif_file: scorecard.sarif
+          category: scorecard

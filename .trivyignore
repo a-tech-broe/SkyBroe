@@ -2,3 +2,17 @@
 # Format: CVE-YYYY-NNNNN
 # Example:
 # CVE-2023-12345  # accepted: no fix available, mitigated by network policy — reviewed 2024-01-15
+
+# ── IaC misconfigurations accepted by design (reviewed 2026-10-28) ──
+# Listed under both the current (AWS-) and legacy (AVD-AWS-) IDs.
+# Egress to 0.0.0.0/0: the host pulls images from Docker Hub, OS packages,
+# and Let's Encrypt certificates; there is no NAT or proxy to narrow it to.
+AWS-0104
+AVD-AWS-0104
+# Ingress 80/443 from 0.0.0.0/0: this is the public web server (Caddy).
+AWS-0107
+AVD-AWS-0107
+# SNS topic without KMS: CloudWatch alarms cannot publish to a topic encrypted
+# with the AWS-managed aws/sns key; alert payloads contain no secrets.
+AWS-0095
+AVD-AWS-0095
